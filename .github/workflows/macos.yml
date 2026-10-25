@@ -167,8 +167,8 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
           xcrun --sdk iphoneos --find mig
-          clang --version | head -n 1
-          "$(brew --prefix llvm)/bin/clang" --version | head -n 1
+          clang --version | sed -n '1p'
+          "$(brew --prefix llvm)/bin/clang" --version | sed -n '1p'
           python3 --version
           missing=0
           for tool in git make clang cmake ninja unifdef ld.lld mformat mcopy dtc xcodebuild; do
@@ -320,7 +320,7 @@ jobs:
             echo "| payload | ${PAYLOAD:-skipped} |"
             echo
             echo "This workflow only checks that the build works. It publishes text logs (7 days) and no images."
-            xcodebuild -version | head -n 1
+            xcodebuild -version | sed -n '1p'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove proprietary inputs
