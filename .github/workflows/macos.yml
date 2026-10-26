@@ -220,7 +220,26 @@ jobs:
         if: inputs.defconfig == 'sheng_defconfig'
         env:
           UNIXNU_DEVICE_REPO: ${{ github.workspace }}/device
+          # This step runs the same `./unixnu build kernel` the step below does,
+          # so it needs the same token: prepare-xnu-source.py lists Apple sources
+          # through the GitHub API, and anonymous calls from hosted runners hit
+          # the shared per-address quota (HTTP 403: rate limit exceeded).
+          GITHUB_TOKEN: ${{ github.token }}
         run: bash device/.ci/qualify-abi.sh
+
+      # EXPERIMENTAL ONLY. A hosted macOS runner cannot run the QEMU HVF
+      # observation the storage audit needs (QEMU reports HV_UNSUPPORTED inside
+      # the runner's own VM; actions/runner-images#13505, closed as not planned),
+      # and no public build plan produces the verified-root SystemOS bundle. This
+      # step supplies both archives from recorded values plus a stub, so the
+      # kernel links at all. The stub makes root-volume verification always
+      # succeed: a kernel built with it does not verify its root volume. Never
+      # present such a build as a verified-root build.
+      - name: Supply the unqualified archives (EXPERIMENTAL)
+        if: inputs.defconfig == 'sheng_defconfig'
+        env:
+          UNIXNU_DEVICE_REPO: ${{ github.workspace }}/device
+        run: bash device/.ci/make-bypass-archives.sh
 
       - name: Build kernel
         id: kernel
