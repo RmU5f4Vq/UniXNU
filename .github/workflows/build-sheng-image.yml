@@ -1,0 +1,477 @@
+name: Build sheng boot image
+
+# Produces flashable artifacts for the Xiaomi Pad 6S Pro (sheng, SM8550).
+# Upstream's "macOS build" workflow stops after the payload and publishes only
+# redacted logs. This one continues through package, firmware and bootimg, and
+# uploads the images, so a fork boots without a local Mac.
+#
+# Pinned sources, declared once here instead of retyped per run:
+#   * Apple restore image  updates.cdn-apple.com (HTTP Range; the 12 GiB zip is never downloaded whole)
+#   * Xiaomi vendor archive  MIUI OTA bucket on Aliyun OSS (MD5-gated in extract-sheng-firmware.py)
+#   * mainline DTS   pinned commit of ianchb/sm8550-mainline
+#
+# Required repository secret:
+#   UNIXNU_UNIQUE_CHIP_ID  platform seed for the ADT; board.toml marks it "required"
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_repository:
+        description: Device repository as owner/name (empty uses this fork's UniXNU-sheng)
+        required: false
+        default: ''
+      device_ref:
+        description: Device repository ref
+        required: true
+        default: main
+      uefi_repository:
+        description: Mu-Silicium firmware repository as owner/name
+        required: true
+        default: UniXNU/uefi-sheng
+      uefi_ref:
+        description: Firmware repository ref
+        required: true
+        default: sheng
+      xcode:
+        description: Xcode version of the macos-26 image
+        required: true
+        default: '26.6'
+      ipsw_url:
+        description: IPSW URL (empty uses the pinned iPadOS 17.7.11 restore image)
+        required: false
+        default: ''
+      trust_cache_url:
+        description: Trust cache bundle URL (optional; masked in the logs)
+        required: false
+        default: ''
+      owner_trust_cache:
+        description: Treat the trust cache URL as an owner-signed bundle
+        type: boolean
+        default: false
+      data_seed_url:
+        description: Data seed URL (optional; masked in the logs)
+        required: false
+        default: ''
+      skip_setup:
+        description: Mark Setup as done in the Data seed
+        type: boolean
+        default: false
+      skip_preflight:
+        description: Skip the board preflight check in the firmware step
+        type: boolean
+        default: false
+      publish_release:
+        description: Publish the images to a GitHub release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sheng-image-${{ github.ref }}-${{ inputs.device_ref }}-${{ inputs.uefi_ref }}
+  cancel-in-progress: false
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_ENV_HINTS: 1
+
+  # Apple restore image. cli_ipsw.py reads the zip directory and each needed
+  # member with HTTP range requests, so out/ipsw never holds the whole archive.
+  PINNED_IPSW_URL: >-
+    https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw
+
+  # Xiaomi vendor archive. download-sheng-firmware.py pins this URL and MD5 and
+  # extract-sheng-firmware.py refuses any other digest: change both together.
+  SHENG_FIRMWARE_URL: >-
+    https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS3.0.305.0.WNXMIXM/sheng_global_images_OS3.0.305.0.WNXMIXM_20260914.0000.00_16.0_global_31450b6677.tgz
+  SHENG_FIRMWARE_MD5: 31450b6677d9e46edc4937c3f797c51d
+
+  # mainline DTS. fetch-sheng-dts.py pins the same commit.
+  SHENG_DTS_REPOSITORY: ianchb/sm8550-mainline
+  SHENG_DTS_COMMIT: 42f3b40c702abbc37c3a04c95af008cd283aeaf3
+
+  # The device-side commit pins of the UEFI extraction tool.
+  UEFITOOL_RELEASE: latest
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 355
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_${{ inputs.xcode }}.app/Contents/Developer
+      # The CLI resolves the device repository from this before -D is remembered.
+      UNIXNU_DEVICE: ${{ github.workspace }}/device
+      UNIXNU_UEFI: ${{ github.workspace }}/device/uefi-sheng
+      DEVICE_DIR: ${{ github.workspace }}/device
+      UEFI_DIR: ${{ github.workspace }}/device/uefi-sheng
+    steps:
+      - name: Check out UniXNU
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the device repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.device_repository || format('{0}/UniXNU-sheng', github.repository_owner) }}
+          ref: ${{ inputs.device_ref }}
+          path: device
+          submodules: recursive
+          token: ${{ secrets.UNIXNU_DEVICE_TOKEN || github.token }}
+
+      # No recursive submodules: the firmware step initialises exactly the ones
+      # board.toml [firmware] submodules names, into this checkout.
+      - name: Check out the firmware
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.uefi_repository }}
+          ref: ${{ inputs.uefi_ref }}
+          path: device/uefi-sheng
+          token: ${{ secrets.UNIXNU_DEVICE_TOKEN || github.token }}
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
+      - name: Check the runner before building
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -m
+          df -h "$GITHUB_WORKSPACE"
+          [ -d "$DEVELOPER_DIR" ] || { echo "::error::Xcode not found at $DEVELOPER_DIR"; exit 1; }
+          [ -f device/board.toml ] || { echo "::error::device repository has no board.toml"; exit 1; }
+          [ -d "$UEFI_DIR/Platforms/Xiaomi/shengPkg" ] || { echo "::error::uefi-sheng has no shengPkg"; exit 1; }
+          [ -f "$UEFI_DIR/Resources/Configs/sheng.toml" ] || { echo "::error::uefi-sheng has no sheng.toml"; exit 1; }
+          xcodebuild -version
+          # The vendor archive (~7 GiB) plus the XNU and EDK II trees need room.
+          # The macos-26 image starts around 14 GiB free; quote the number for diagnosis.
+          df -g "$GITHUB_WORKSPACE" | sed -n '2p'
+
+      - name: Install host tools
+        run: |
+          set -euo pipefail
+          brew install llvm lld mtools dtc
+          if ! command -v unifdef >/dev/null; then
+            brew install unifdef
+            echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
+          fi
+          export PATH="$(brew --prefix llvm)/bin:$PATH"
+          for tool in clang ld.lld dtc fdtget fdtput mformat mcopy make; do
+            command -v "$tool" >/dev/null || { echo "::error::$tool is missing"; exit 1; }
+          done
+
+      # import-sheng-uefi.py drives build/tools/uefiextract/uefiextract on the
+      # vendor UEFI image, and the repository does not carry that binary.
+      - name: Install the UEFI extraction tool
+        run: |
+          set -euo pipefail
+          mkdir -p device/build/tools/uefiextract
+          api="https://api.github.com/repos/LongSoft/UEFITool/releases/$UEFITOOL_RELEASE"
+          url=$(curl -fsSL "$api" | jq -r '[.assets[] | select(.name | test("mac"; "i")) | .browser_download_url][0] // empty')
+          [ -n "$url" ] || { echo "::error::no macOS asset in LongSoft/UEFITool $UEFITOOL_RELEASE"; exit 1; }
+          echo "UEFITool asset: $url"
+          curl -fsSL "$url" -o "$RUNNER_TEMP/uefitool.zip"
+          unzip -o -q "$RUNNER_TEMP/uefitool.zip" -d "$RUNNER_TEMP/uefitool"
+          bin=$(find "$RUNNER_TEMP/uefitool" -type f -name 'uefiextract*' ! -name '*.txt' | head -1)
+          [ -n "$bin" ] || { echo "::error::the archive has no uefiextract"; exit 1; }
+          install -m 755 "$bin" device/build/tools/uefiextract/uefiextract
+          xattr -d com.apple.quarantine device/build/tools/uefiextract/uefiextract 2>/dev/null || true
+          device/build/tools/uefiextract/uefiextract 2>&1 | head -3 || true
+
+      # Reachability only; the tools below fetch what they need.
+      - name: Check the pinned sources
+        env:
+          IPSW: ${{ inputs.ipsw_url || env.PINNED_IPSW_URL }}
+        run: |
+          set -euo pipefail
+          echo "IPSW      $IPSW"
+          curl -fsSL -o /dev/null -r 0-3 "$IPSW" && echo 'IPSW serves byte ranges'
+          echo "firmware  $SHENG_FIRMWARE_URL"
+          echo "firmware  MD5 $SHENG_FIRMWARE_MD5"
+          curl -fsSI "$SHENG_FIRMWARE_URL" | tr -d '\r' | grep -Ei '^(accept-ranges|content-length):' || true
+          echo "DTS       $SHENG_DTS_REPOSITORY@$SHENG_DTS_COMMIT"
+
+      - name: Fetch the pinned sources
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./unixnu fetch -D "$DEVICE_DIR"
+
+      - name: Select the device configuration
+        id: select
+        env:
+          DEFCONFIG: sheng_defconfig
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'scripts')
+          from unixnu.cli import parser, cmd_defconfig
+          from unixnu.config import Context
+          ctx = Context(parser().parse_args(['defconfig', os.environ['DEFCONFIG']]))
+          cmd_defconfig(ctx)
+          name = ctx.board.get('board', {}).get('name')
+          if not name:
+              sys.exit('::error::board.toml needs [board] name')
+          adt = ctx.board.get('payload', {}).get('adt', {})
+          has_seed = bool(os.environ.get('UNIXNU_UNIQUE_CHIP_ID'))
+          if adt.get('unique_chip_id') == 'required' and not has_seed:
+              print('::warning::this board needs the platform seed for its payload', file=sys.stderr)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'board={name}\n')
+              out.write(f'work={ctx.work}\n')
+          print('board', name)
+          print('work', ctx.work)
+          PY
+
+      # Xiaomi vendor archive: resumed on byte ranges, MD5-verified, then reduced
+      # to the files the port consumes. --delete-archive keeps the runner free.
+      - name: Download the vendor archive
+        run: |
+          set -euo pipefail
+          python3 "$DEVICE_DIR/scripts/download-sheng-firmware.py"
+          python3 "$DEVICE_DIR/scripts/extract-sheng-firmware.py" --delete-archive
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          manifest = Path('device/.cache/firmware/sheng/porting-inputs.json')
+          data = json.loads(manifest.read_text())
+          assert data['gzip_integrity_verified'], 'gzip integrity was not verified'
+          assert data['archive_md5'] == '31450b6677d9e46edc4937c3f797c51d', data['archive_md5']
+          print(data['source_url'])
+          print(f"{len(data['selected'])} inputs, {data['retained_bytes'] / 1024**2:.1f} MiB retained")
+          for entry in data['selected']:
+              print(f"  {entry['file']:<26} {entry['bytes'] / 1024**2:8.1f} MiB")
+          assert any(e['file'].lower().startswith('uefi') for e in data['selected']), 'no uefi.elf'
+          PY
+          df -g "$GITHUB_WORKSPACE" | sed -n '2p'
+
+      # Genuine vendor UEFI modules become EDK II INF wrappers under
+      # device/uefi-sheng/Binaries/sheng; uefiplat.cfg lands in the cache.
+      - name: Import the vendor UEFI modules
+        run: python3 "$DEVICE_DIR/scripts/import-sheng-uefi.py"
+
+      - name: Compile the board device tree
+        run: |
+          set -euo pipefail
+          cd "$DEVICE_DIR"
+          python3 scripts/fetch-sheng-dts.py
+          ls -l build/sheng/sheng.dtb
+
+      - name: Build the kernel
+        env:
+          IPSW: ${{ inputs.ipsw_url || env.PINNED_IPSW_URL }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./unixnu build kernel -D "$DEVICE_DIR" --ipsw "$IPSW"
+
+      - name: Build the UEFI package
+        run: ./unixnu build package -D "$DEVICE_DIR"
+
+      # check-sheng.py resolves uefi-sheng and the compiled DTB relative to the
+      # tree, so expose both there before the firmware step runs it.
+      - name: Stage the preflight inputs
+        env:
+          WORK: ${{ steps.select.outputs.work }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK/tree/build/sheng"
+          cp "$DEVICE_DIR/build/sheng/sheng.dtb" "$WORK/tree/build/sheng/sheng.dtb"
+          ln -sfn "$UEFI_DIR" "$WORK/tree/uefi-sheng"
+          ls -l "$WORK/tree/uefi-sheng" "$WORK/tree/build/sheng/sheng.dtb"
+
+      - name: Build the firmware
+        env:
+          SKIP_PREFLIGHT: ${{ inputs.skip_preflight }}
+        run: |
+          set -euo pipefail
+          args=(--device "$DEVICE_DIR" --uefi "$UEFI_DIR")
+          if [ "$SKIP_PREFLIGHT" = "true" ] || [ "$SKIP_PREFLIGHT" = "True" ]; then
+            args+=(--skip-preflight)
+          fi
+          ./unixnu build firmware "${args[@]}"
+
+      - name: Prepare payload inputs
+        if: inputs.trust_cache_url != '' || inputs.data_seed_url != ''
+        run: |
+          set -euo pipefail
+          trust=$(jq -r '.inputs.trust_cache_url // ""' "$GITHUB_EVENT_PATH")
+          seed=$(jq -r '.inputs.data_seed_url // ""' "$GITHUB_EVENT_PATH")
+          if [ -n "$trust" ]; then echo "::add-mask::$trust"; curl -fsSL --retry 3 "$trust" -o "$RUNNER_TEMP/trustcache"; fi
+          if [ -n "$seed" ]; then echo "::add-mask::$seed"; curl -fsSL --retry 3 "$seed" -o "$RUNNER_TEMP/data.dbr"; fi
+
+      - name: Build the payload
+        env:
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          SKIP_SETUP: ${{ inputs.skip_setup }}
+          OWNER_TRUST_CACHE: ${{ inputs.owner_trust_cache }}
+        run: |
+          set -euo pipefail
+          if [ -z "${UNIXNU_UNIQUE_CHIP_ID:-}" ]; then
+            echo '::error::board.toml marks the platform seed required: set the UNIXNU_UNIQUE_CHIP_ID secret'
+            exit 1
+          fi
+          args=(--device "$DEVICE_DIR" --uefi "$UEFI_DIR")
+          if [ -f "$RUNNER_TEMP/trustcache" ]; then
+            if [ "$OWNER_TRUST_CACHE" = "true" ] || [ "$OWNER_TRUST_CACHE" = "True" ]; then
+              args+=(--owner-trust-cache "$RUNNER_TEMP/trustcache")
+            else
+              args+=(--trust-cache "$RUNNER_TEMP/trustcache")
+            fi
+          fi
+          if [ -f "$RUNNER_TEMP/data.dbr" ]; then args+=(--data-ramdisk "$RUNNER_TEMP/data.dbr"); fi
+          if [ "$SKIP_SETUP" = "true" ] || [ "$SKIP_SETUP" = "True" ]; then args+=(--skip-setup); fi
+          ./unixnu build payload "${args[@]}"
+
+      # BootShim + firmware volume, gzipped, with the mainline DTB appended and
+      # the payload as ramdisk. board.toml [[bootimg.dtb_node]] adds splash_region,
+      # which stock ABL needs before it hands the panel over.
+      - name: Pack the boot image
+        env:
+          UNIXNU_DTB: ${{ github.workspace }}/device/build/sheng/sheng.dtb
+        run: |
+          set -euo pipefail
+          ./unixnu bootimg -D "$DEVICE_DIR" --uefi "$UEFI_DIR" \
+            --dtb "$DEVICE_DIR/build/sheng/sheng.dtb"
+
+      - name: Report the artifacts
+        env:
+          WORK: ${{ steps.select.outputs.work }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, os
+          from pathlib import Path
+          work = Path(os.environ['WORK'])
+          for rel in ('boot/boot.json', 'payload/payload.json'):
+              path = work / rel
+              print(f'--- {rel}')
+              print(path.read_text() if path.is_file() else 'missing')
+          for img in sorted((work / 'boot').glob('*.img')):
+              print(f"{img.name}: {img.stat().st_size} bytes  sha256 {hashlib.sha256(img.read_bytes()).hexdigest()}")
+          PY
+          df -g "$GITHUB_WORKSPACE" | sed -n '2p'
+
+      - name: Upload the boot image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sheng-boot-${{ github.run_attempt }}
+          path: |
+            ${{ steps.select.outputs.work }}/boot/boot.img
+            ${{ steps.select.outputs.work }}/boot/boot.json
+            ${{ steps.select.outputs.work }}/payload/payload.img
+            ${{ steps.select.outputs.work }}/payload/payload.json
+            ${{ steps.select.outputs.work }}/kernel/kernel.macho
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload the firmware volume
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sheng-firmware-${{ github.run_attempt }}
+          path: device/uefi-sheng/Build/shengPkg/*_CLANGPDB/FV/*.fd
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Stage the text logs
+        if: always() && steps.select.outcome == 'success'
+        env:
+          WORK: ${{ steps.select.outputs.work }}
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, shutil
+          from pathlib import Path
+          source = Path(os.environ['WORK']) / 'logs'
+          target = Path(os.environ['RUNNER_TEMP']) / 'public-logs'
+          shutil.rmtree(target, ignore_errors=True)
+          target.mkdir(parents=True)
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          inputs = event.get('inputs', {}) or {}
+          secrets = [os.environ.get('UNIXNU_UNIQUE_CHIP_ID', ''),
+                     inputs.get('trust_cache_url', ''),
+                     inputs.get('data_seed_url', '')]
+          secrets = [value for value in secrets if value]
+          count = 0
+          for path in sorted(source.glob('*.log')) if source.is_dir() else []:
+              data = path.read_bytes()
+              if b'\0' in data:
+                  continue
+              text = data.decode('utf-8', 'replace')
+              for value in secrets:
+                  text = text.replace(value, '***')
+              text = re.sub(r'https?://[^\s"\']*[?&](?:token|sig|signature|key|X-Amz-Signature)=[^\s"\']*', '***', text, flags=re.I)
+              (target / path.name).write_text(text)
+              count += 1
+          print(f'{count} text logs staged')
+          PY
+
+      - name: Upload the logs
+        if: always() && steps.select.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sheng-logs-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/public-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Publish the release
+        if: inputs.publish_release == true && success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORK: ${{ steps.select.outputs.work }}
+        run: |
+          set -euo pipefail
+          tag="sheng-$(date -u +%Y%m%d-%H%M%S)"
+          gh release create "$tag" \
+            "$WORK/boot/boot.img#boot.img" \
+            "$WORK/payload/payload.img#payload.img" \
+            --title "sheng boot image $tag" \
+            --notes "UniXNU ${GITHUB_SHA}. Flash with: fastboot flash boot_b boot.img && fastboot set_active b"
+
+      - name: Summary
+        if: always()
+        env:
+          WORK: ${{ steps.select.outputs.work }}
+          PREFLIGHT: ${{ inputs.skip_preflight }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## sheng boot image"
+            echo
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| device | \`${{ inputs.device_repository || 'fork UniXNU-sheng' }}\` @ \`${{ inputs.device_ref }}\` |"
+            echo "| firmware | \`${{ inputs.uefi_repository }}\` @ \`${{ inputs.uefi_ref }}\` |"
+            echo "| UniXNU | \`${GITHUB_SHA}\` |"
+            echo "| Xcode | ${{ inputs.xcode }} |"
+            echo "| preflight | ${PREFLIGHT:-false} |"
+            echo
+            echo 'First test, nothing written: `fastboot boot boot.img`'
+            echo
+            echo 'Flash to the spare slot: `fastboot flash boot_b boot.img && fastboot set_active b` (slot a keeps the way back)'
+            echo
+            if [ -f "$WORK/boot/boot.json" ]; then
+              echo '```json'
+              cat "$WORK/boot/boot.json"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Scrub the Apple and Xiaomi inputs: they must not stay on a hosted runner.
+      - name: Remove proprietary inputs
+        if: always()
+        run: |
+          rm -rf out/ipsw out/feeds device/.cache/firmware/sheng \
+                 out/*/tree/.cache/firmware out/*/payload/data-skip-setup-* \
+                 out/*/*/*/tree/.cache/firmware out/*/*/*/payload/data-skip-setup-*
+          rm -f "$RUNNER_TEMP/trustcache" "$RUNNER_TEMP/data.dbr" "$RUNNER_TEMP/data-grow.dbr" "$RUNNER_TEMP/uefitool.zip"
+          rm -rf "$RUNNER_TEMP/uefitool"
+          df -g "$GITHUB_WORKSPACE" | sed -n '2p'
