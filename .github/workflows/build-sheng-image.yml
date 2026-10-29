@@ -88,12 +88,15 @@ env:
     https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS3.0.305.0.WNXMIXM/sheng_global_images_OS3.0.305.0.WNXMIXM_20260914.0000.00_16.0_global_31450b6677.tgz
   SHENG_FIRMWARE_MD5: 31450b6677d9e46edc4937c3f797c51d
 
+  # UEFI extraction tool: release A76 ships one universal Mach-O (arm64 + x86_64)
+  # at the archive root, which import-sheng-uefi.py drives as uefiextract.
+  UEFITOOL_URL: >-
+    https://github.com/LongSoft/UEFITool/releases/download/A76/UEFIExtract_NE_A76_universal_mac.zip
+  UEFITOOL_SHA256: f3c5ca9402df3c14b28242dcd04b527791a12c1c0bf3c1cbbb3d1a0445168ec5
+
   # mainline DTS. fetch-sheng-dts.py pins the same commit.
   SHENG_DTS_REPOSITORY: ianchb/sm8550-mainline
   SHENG_DTS_COMMIT: 42f3b40c702abbc37c3a04c95af008cd283aeaf3
-
-  # The device-side commit pins of the UEFI extraction tool.
-  UEFITOOL_RELEASE: latest
 
 defaults:
   run:
@@ -167,23 +170,45 @@ jobs:
             command -v "$tool" >/dev/null || { echo "::error::$tool is missing"; exit 1; }
           done
 
-      # import-sheng-uefi.py drives build/tools/uefiextract/uefiextract on the
-      # vendor UEFI image, and the repository does not carry that binary.
+      # import-sheng-uefi.py drives build/tools/uefiextract/uefiextract on the vendor
+      # UEFI image. A76 ships that binary as one universal Mach-O at the archive
+      # root; the arm64 slice is the one macos-26 runs.
       - name: Install the UEFI extraction tool
         run: |
           set -euo pipefail
-          mkdir -p device/build/tools/uefiextract
-          api="https://api.github.com/repos/LongSoft/UEFITool/releases/$UEFITOOL_RELEASE"
-          url=$(curl -fsSL "$api" | jq -r '[.assets[] | select(.name | test("mac"; "i")) | .browser_download_url][0] // empty')
-          [ -n "$url" ] || { echo "::error::no macOS asset in LongSoft/UEFITool $UEFITOOL_RELEASE"; exit 1; }
-          echo "UEFITool asset: $url"
-          curl -fsSL "$url" -o "$RUNNER_TEMP/uefitool.zip"
-          unzip -o -q "$RUNNER_TEMP/uefitool.zip" -d "$RUNNER_TEMP/uefitool"
-          bin=$(find "$RUNNER_TEMP/uefitool" -type f -name 'uefiextract*' ! -name '*.txt' | head -1)
-          [ -n "$bin" ] || { echo "::error::the archive has no uefiextract"; exit 1; }
-          install -m 755 "$bin" device/build/tools/uefiextract/uefiextract
-          xattr -d com.apple.quarantine device/build/tools/uefiextract/uefiextract 2>/dev/null || true
-          device/build/tools/uefiextract/uefiextract 2>&1 | head -3 || true
+          curl -fsSL "$UEFITOOL_URL" -o "$RUNNER_TEMP/uefitool.zip"
+          echo "$UEFITOOL_SHA256  $RUNNER_TEMP/uefitool.zip" | shasum -a 256 -c -
+          python3 - "$RUNNER_TEMP/uefitool.zip" <<'PY'
+          import os, struct, sys, zipfile
+          from pathlib import Path
+
+          dest = Path('device/build/tools/uefiextract')
+          dest.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(sys.argv[1]) as archive:
+              entries = [i for i in archive.infolist() if not i.is_dir()]
+              print('archive holds:', ', '.join(e.filename for e in entries))
+              exe = next((i for i in entries
+                          if os.path.basename(i.filename).lower() == 'uefiextract'), None)
+              if exe is None:
+                  sys.exit('::error::this release no longer carries UEFIExtract at the archive root')
+              data = archive.read(exe)
+          if struct.unpack_from('>I', data)[0] != 0xCAFEBABE:
+              sys.exit('::error::UEFIExtract is not a universal Mach-O')
+          slices = struct.unpack_from('>I', data, 4)[0]
+          kinds = {0x0100000C: 'arm64', 0x01000007: 'x86_64'}
+          found = [kinds.get(struct.unpack_from('>I', data, 8 + i * 20)[0], 'other') for i in range(slices)]
+          print('slices:', ', '.join(found))
+          if 'arm64' not in found:
+              sys.exit('::error::UEFIExtract has no arm64 slice for this runner')
+          out = dest / 'uefiextract'
+          out.write_bytes(data)
+          out.chmod(0o755)
+          print(f'installed {exe.filename}: {len(data)} bytes')
+          PY
+          file device/build/tools/uefiextract/uefiextract
+          xattr -c device/build/tools/uefiextract/uefiextract 2>/dev/null || true
+          echo '--- smoke test: a usage banner means the binary runs here ---'
+          device/build/tools/uefiextract/uefiextract 2>&1 | head -5 || true
 
       # Reachability only; the tools below fetch what they need.
       - name: Check the pinned sources
