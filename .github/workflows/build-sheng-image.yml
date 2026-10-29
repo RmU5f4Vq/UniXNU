@@ -297,6 +297,81 @@ jobs:
           fi
           ./unixnu build firmware "${args[@]}"
 
+      # The two original Apple trust modules come straight out of the target IPSW:
+      # StaticTrustCache and Cryptex1,SystemTrustCache. DarwinBoot refuses a bundle
+      # whose hashes are not ascending and whose modules are not version 2, so the
+      # result is checked against the digests build-original-system-trust.py pins.
+      - name: Build the original trust bundle
+        id: trust
+        env:
+          IPSW: ${{ inputs.ipsw_url || env.PINNED_IPSW_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p device/build/original-trust
+          python3 - <<'PY'
+          import hashlib, json, os, plistlib, struct, sys, zipfile
+          sys.path.insert(0, 'scripts')
+          from unixnu.ipsw import RangeFile, im4p_payload
+
+          STATIC_SHA = 'da88460e6e513438d5307e5c526f76497a74754476a24da29f239f0c90120fc2'
+          SYSTEM_SHA = 'd121ba89167e03aafd00fa687c30cd8ebc4ccafd10c1408adb2ba3de12403651'
+          BUNDLE_SHA = '7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7'
+
+          url = os.environ['IPSW']
+          with zipfile.ZipFile(RangeFile(url)) as archive:
+              manifest = plistlib.loads(archive.read('BuildManifest.plist'))
+              if (manifest['ProductVersion'], manifest['ProductBuildVersion']) != ('17.7.11', '21H461'):
+                  sys.exit(f"::error::IPSW is {manifest['ProductVersion']} {manifest['ProductBuildVersion']}, the board needs 17.7.11 21H461")
+              identity = next((i for i in manifest['BuildIdentities']
+                               if i['Info']['DeviceClass'] == 'j120ap' and i['Info']['RestoreBehavior'] == 'Erase'), None)
+              if identity is None:
+                  sys.exit('::error::this IPSW has no j120ap Erase identity')
+              members = {kind: identity['Manifest'][kind]['Info']['Path']
+                         for kind in ('StaticTrustCache', 'Cryptex1,SystemTrustCache')}
+              blobs = {kind: archive.read(path) for kind, path in members.items()}
+
+          def candidates(data):
+              """The member as stored, then its IM4P payload: the IPSW wraps some of these."""
+              out = [('raw', data)]
+              try:
+                  out.append(('im4p', im4p_payload(data)))
+              except Exception:
+                  pass
+              return out
+
+          def pick(kind, expected):
+              tried = []
+              for label, blob in candidates(blobs[kind]):
+                  digest = hashlib.sha256(blob).hexdigest()
+                  tried.append(f'{label}={digest}')
+                  if digest == expected and struct.unpack_from('<I', blob)[0] == 2:
+                      return blob
+              sys.exit(f'::error::{kind} does not match the pinned module ({", ".join(tried)}); '
+                       f'the IPSW build or the pin is different')
+
+          static = pick('StaticTrustCache', STATIC_SHA)
+          system = pick('Cryptex1,SystemTrustCache', SYSTEM_SHA)
+          for name, module in (('static', static), ('system', system)):
+              count = struct.unpack_from('<I', module, 20)[0]
+              if len(module) != 24 + count * 24:
+                  sys.exit(f'::error::the {name} module is not a complete version-2 module')
+
+          bundle = struct.pack('<3I', 2, 12, 12 + len(static)) + static + system
+          digest = hashlib.sha256(bundle).hexdigest()
+          if digest != BUNDLE_SHA:
+              sys.exit(f'::error::bundle is {digest}, expected {BUNDLE_SHA}')
+
+          out = 'device/build/original-trust'
+          open(f'{out}/trust.bundle', 'wb').write(bundle)
+          report = dict(bundle_sha256=digest,
+                        static=dict(member=members['StaticTrustCache'], sha256=STATIC_SHA),
+                        system=dict(member=members['Cryptex1,SystemTrustCache'], sha256=SYSTEM_SHA),
+                        own_code_entries_added=False, gpu_plugin_included=False)
+          open(f'{out}/trust.json', 'w').write(json.dumps(report, indent=2) + '\n')
+          print(json.dumps(report, indent=2))
+          print(f'trust bundle {len(bundle)} bytes')
+          PY
+
       - name: Prepare payload inputs
         if: inputs.trust_cache_url != '' || inputs.data_seed_url != ''
         run: |
@@ -324,6 +399,12 @@ jobs:
             else
               args+=(--trust-cache "$RUNNER_TEMP/trustcache")
             fi
+            echo 'trust cache: the supplied bundle'
+          elif [ -f "$DEVICE_DIR/build/original-trust/trust.bundle" ]; then
+            args+=(--trust-cache "$DEVICE_DIR/build/original-trust/trust.bundle")
+            echo 'trust cache: the two original Apple modules from the IPSW (no GPU plugin)'
+          else
+            echo '::warning::no trust cache: the image builds but AMFI will refuse the original kexts'
           fi
           if [ -f "$RUNNER_TEMP/data.dbr" ]; then args+=(--data-ramdisk "$RUNNER_TEMP/data.dbr"); fi
           if [ "$SKIP_SETUP" = "true" ] || [ "$SKIP_SETUP" = "True" ]; then args+=(--skip-setup); fi
