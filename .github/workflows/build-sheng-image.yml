@@ -310,7 +310,6 @@ jobs:
         id: snapshot
         env:
           SNAPSHOT: ${{ inputs.snapshot_url }}
-          ALLOW_MISSING: ${{ inputs.allow_missing_snapshot }}
           WORK: ${{ steps.select.outputs.work }}
         run: |
           set -euo pipefail
@@ -337,6 +336,33 @@ jobs:
                   print(f'injected {name}: {target.stat().st_size} bytes')
           PY
           fi
+
+
+      # audit-storage-interface.py consumes a QEMU/GDB snapshot that no repository
+      # script writes; make-storage-snapshot.py produces it by reusing the audit's
+      # own metaclass derivation. It needs a prelink candidate, so it only runs when
+      # one is already present in the tree.
+      - name: Generate the qualification snapshot
+        env:
+          WORK: ${{ steps.select.outputs.work }}
+        run: |
+          set -euo pipefail
+          TREE="$WORK/tree"
+          if [ ! -f "$TREE/build/xnu-prelink/native-apfs-load-positive.macho" ]; then
+            echo '::warning::no native-apfs-load-positive prelink candidate in the tree;'
+            echo 'the snapshot generator needs one, so the kernel step will need snapshot_url'
+            exit 0
+          fi
+          python3 "$GITHUB_WORKSPACE/.github/scripts/make-storage-snapshot.py" --root "$TREE"
+
+      # Checked only after both the injected archive and the generator have run.
+      - name: Verify the qualification snapshot
+        env:
+          ALLOW_MISSING: ${{ inputs.allow_missing_snapshot }}
+          WORK: ${{ steps.select.outputs.work }}
+        run: |
+          set -euo pipefail
+          TREE="$WORK/tree"
           python3 - "$TREE" <<'PY'
           import json, os, sys
           from pathlib import Path
@@ -362,25 +388,6 @@ jobs:
               for name, rel in required.items():
                   print(f'  {name:<24} build/{rel}')
           PY
-
-
-      # audit-storage-interface.py consumes a QEMU/GDB snapshot that no repository
-      # script writes; make-storage-snapshot.py produces it by reusing the audit's
-      # own metaclass derivation. It needs a prelink candidate, so it only runs when
-      # one is already present in the tree.
-      - name: Generate the qualification snapshot
-        env:
-          WORK: ${{ steps.select.outputs.work }}
-        run: |
-          set -euo pipefail
-          TREE="$WORK/tree"
-          if [ ! -f "$TREE/build/xnu-prelink/native-apfs-load-positive.macho" ]; then
-            echo '::warning::no native-apfs-load-positive prelink candidate in the tree;'
-            echo 'the snapshot generator needs one, so the kernel step will need snapshot_url'
-            exit 0
-          fi
-          python3 "$GITHUB_WORKSPACE/.github/scripts/make-storage-snapshot.py" --root "$TREE"
-
       - name: Build the kernel
         env:
           IPSW: ${{ inputs.ipsw_url || env.PINNED_IPSW_URL }}
