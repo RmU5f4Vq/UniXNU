@@ -325,12 +325,17 @@ jobs:
             echo "::error::device repository has no configs/sheng_bringup_defconfig"
             exit 1
           fi
+          # stage 1 builds under its own work directory, named after the defconfig, so
+          # the tree it compiles in is not the one WORK points at.
+          BRINGUP_NAME="${BRINGUP##*/}"
+          BRINGUP_NAME="${BRINGUP_NAME%_defconfig}"
+          BRINGUP_WORK="$(dirname "$WORK")/$BRINGUP_NAME"
+          echo "stage-1 work: $BRINGUP_WORK"
           # build-boot-progress.py compiles kits/sheng/BootProgress.c, which includes
-          # Font.h from the firmware checkout. The tree has to expose uefi-sheng at
-          # this point, not only before the stage-2 firmware step.
-          mkdir -p "$WORK/tree"
-          ln -sfn "$UEFI_DIR" "$WORK/tree/uefi-sheng"
-          FONT="$WORK/tree/uefi-sheng/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/Font.h"
+          # Font.h from the firmware checkout, so that tree must expose uefi-sheng.
+          mkdir -p "$BRINGUP_WORK/tree"
+          ln -sfn "$UEFI_DIR" "$BRINGUP_WORK/tree/uefi-sheng"
+          FONT="$BRINGUP_WORK/tree/uefi-sheng/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/Font.h"
           if [ ! -f "$FONT" ]; then
             echo "::error::Font.h is missing from the firmware checkout at $FONT"
             exit 1
@@ -387,9 +392,11 @@ jobs:
           PY
           ./unixnu defconfig sheng_bringup_defconfig -D "$DEVICE_DIR"
           ./unixnu build kernel -D "$DEVICE_DIR" --ipsw "${IPSW:-$PINNED_IPSW_URL}"
+          # The snapshot generator reads the tree of the configuration it is given, so
+          # the candidate goes into the stage-2 tree that later steps use.
           mkdir -p "$WORK/tree/build/xnu-prelink"
-          cp "$WORK/kernel/kernel.macho" "$WORK/tree/build/xnu-prelink/native-apfs-load-positive.macho"
-          report=$(ls "$WORK"/kernel/*.json 2>/dev/null | head -1 || true)
+          cp "$BRINGUP_WORK/kernel/kernel.macho" "$WORK/tree/build/xnu-prelink/native-apfs-load-positive.macho"
+          report=$(ls "$BRINGUP_WORK"/kernel/*.json 2>/dev/null | head -1 || true)
           if [ -z "$report" ]; then
             echo '::error::the prelink step wrote no report next to kernel.macho'
             exit 1
