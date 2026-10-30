@@ -23,6 +23,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -123,8 +124,8 @@ def derive(root):
     return namespace
 
 
-def build_esp(root, kernel, output, memory_mib, platform):
-    esp = output / 'esp'
+def build_esp(root, kernel, output, memory_mib, platform, accel='tcg'):
+    esp = output / 'esp' if accel == 'tcg' else output / f'esp-{accel}'
     payloads = esp / 'EFI/UniXNU/Payloads'
     payloads.mkdir(parents=True, exist_ok=True)
     (esp / 'EFI/BOOT').mkdir(parents=True, exist_ok=True)
@@ -137,16 +138,114 @@ def build_esp(root, kernel, output, memory_mib, platform):
     dt = ['python3', str(root / 'scripts/qemu-entry/make-dt.py'),
           '--output', str(payloads / 'kernel.macho.adt'),
           '--dram-size', str(memory_mib * 1024 ** 2),
-          '--qemu-accel', 'tcg', '--armvirt']
+          '--qemu-accel', accel, '--armvirt']
     if platform:
         dt += ['--platform-compatible', platform]
     subprocess.run(dt, check=True)
 
+    # serial=3 is the only channel that reports how far the guest got: UEFI, the
+    # DarwinBoot hand-off or XNU itself. boot-progress is absent on purpose, the
+    # bring-up configuration leaves CONFIG_XNU_BOOT_PROGRESS off.
     (esp / 'EFI/UniXNU/unixnu.toml').write_text(
         'version = 1\n\n[boot]\ntimeout = 0\ndefault = "xnu"\n\n[kits]\nautoload = false\n\n'
         '[[entry]]\nid = "xnu"\ntitle = "UniXNU"\ntype = "xnu"\n'
-        'path = "Payloads/kernel.macho"\nargs = "-v serial=3 boot-progress=0"\n')
+        'path = "Payloads/kernel.macho"\nargs = "-v serial=3"\n')
     return esp
+
+
+def serial_tail(path, count=400):
+    if not path.is_file():
+        return b''
+    with path.open('rb') as stream:
+        stream.seek(0, 2)
+        size = stream.tell()
+        stream.seek(max(0, size - count))
+        return stream.read()
+
+
+def run_guest(root, kernel, output, accel, seconds, memory_mib, platform,
+              stop, requests):
+    """One QEMU boot. Returns (report, fixture) or (None, fixture) on refusal."""
+    fixture = output / f'qemu-{accel}'
+    fixture.mkdir(parents=True, exist_ok=True)
+    for stale in ('gdb-stop.json', 'gdb-failure.json', 'gdb-uart.log'):
+        (fixture / stale).unlink(missing_ok=True)
+    esp = build_esp(root, kernel, output, memory_mib, platform, accel)
+
+    command = ['python3', str(root / 'scripts/qemu-entry/gdb-stop.py'), hex(stop),
+               '--fixture', str(fixture), '--esp', str(esp), '--kernel', str(kernel),
+               '--system-registers', '--timeout', str(seconds),
+               '--qemu-accel', accel, '--qemu-memory-mib', str(memory_mib)]
+    for request in requests:
+        command += ['--read-memory', request]
+    print('running:', ' '.join(command), flush=True)
+
+    # The guest runs for tens of minutes, so report where it is instead of
+    # blocking on a silent child: the serial log is the only progress signal,
+    # and a frozen byte count means the guest stopped making forward progress.
+    uart = fixture / 'gdb-uart.log'
+    started, seen_size = time.monotonic(), -1
+    process = subprocess.Popen(command)
+    while process.poll() is None:
+        time.sleep(15)
+        size = uart.stat().st_size if uart.is_file() else 0
+        elapsed = time.monotonic() - started
+        if size == seen_size:
+            print(f'  [{accel}] {elapsed:6.0f}s  serial {size} B, no new output', flush=True)
+            continue
+        seen_size = size
+        lines = serial_tail(uart).decode(errors='replace').strip().splitlines()
+        print(f'  [{accel}] {elapsed:6.0f}s  serial {size} B | '
+              f'{lines[-1][:160] if lines else "(nothing yet)"}', flush=True)
+    returncode = process.wait()
+    print(f'  [{accel}] exited {returncode} after {time.monotonic() - started:.0f}s', flush=True)
+
+    if uart.is_file():
+        print(f'[{accel}] guest serial log: {uart.stat().st_size} bytes')
+    report_path = fixture / 'gdb-stop.json'
+    if returncode or not report_path.is_file():
+        failure = fixture / 'gdb-failure.json'
+        if failure.is_file():
+            print(failure.read_text(), file=sys.stderr)
+        return None, fixture
+    return json.loads(report_path.read_text()), fixture
+
+
+def describe_serial(fixture, tail_bytes=6000):
+    uart = fixture / 'gdb-uart.log'
+    if not uart.is_file() or not uart.stat().st_size:
+        print('the guest wrote nothing to its serial port', file=sys.stderr)
+        return
+    tail = uart.read_bytes()[-tail_bytes:]
+    print('--- guest serial (tail) ---', file=sys.stderr)
+    print(tail.decode(errors='replace'), file=sys.stderr)
+    print('--- end guest serial ---', file=sys.stderr)
+
+
+def judge(report, requests, registers_needed):
+    """Return None when the snapshot qualifies, else the reason it does not."""
+    if report.get('bounded_timeout_interrupted'):
+        return (f'the guest did not reach _panic before the deadline '
+                f'(stopped at pc {report.get("pc")})')
+    memory = report.get('memory') or {}
+    absent = [request for request in requests
+              if not memory.get(request) or memory[request].startswith('E')]
+    if absent:
+        return (f'cannot read {", ".join(absent)}: the guest stopped before IOKit '
+                f'initialised these metaclasses (pc {report.get("pc")})')
+    registers = report.get('system_registers') or {}
+    missing = [name for name in registers_needed if name not in registers]
+    if missing:
+        return f'the snapshot lacks {", ".join(missing)}'
+    tcr = int(registers['TCR_EL1'], 16)
+    if tcr >> 14 & 3 or tcr >> 30 & 3 != 2 or not int(registers['SCTLR_EL1'], 16) & 1:
+        return (f'TCR_EL1 {registers["TCR_EL1"]} / SCTLR_EL1 {registers["SCTLR_EL1"]} '
+                f'is not the enabled native 4K configuration the audit requires')
+    for name in ('TTBR0_EL1', 'TTBR1_EL1'):
+        if not int(registers[name], 16):
+            return (f'{name} is zero: the guest stopped before XNU built its own tables, '
+                    f'so the snapshot cannot qualify live 4K translation')
+    return None
 
 
 def main():
@@ -157,11 +256,17 @@ def main():
                         help='prelink candidate (default: build/xnu-prelink/native-apfs-load-positive.macho)')
     parser.add_argument('--output', type=Path,
                         help='output directory (default: build/darwinboot-storage-native-metadata)')
-    parser.add_argument('--timeout', type=float, default=280.0,
-                        help='guest deadline in seconds; TCG emulation needs minutes to reach IOKit')
+    parser.add_argument('--timeout', type=float, default=1800.0,
+                        help='guest deadline in seconds; TCG must run EDK II, UniXNU and DarwinBoot '
+                             'before XNU reaches IOKit, which takes tens of minutes, not seconds')
+    parser.add_argument('--accel', choices=['tcg'], default='tcg',
+                        help='guest accelerator; the macOS runners offer TCG only')
     parser.add_argument('--qemu-memory-mib', type=int, choices=[1024, 2048, 4096, 8192], default=1024)
     parser.add_argument('--platform-compatible', default='xiaomi,sheng',
                         help='DT platform compatible string for QEMU (empty to omit)')
+    parser.add_argument('--log-dir', type=Path,
+                        help='keep the guest serial log and the raw GDB reports here; without it the '
+                             'only record of where the guest stopped is deleted with the fixture')
     args = parser.parse_args()
 
     root = args.root.resolve()
@@ -190,40 +295,51 @@ def main():
     for stale in ('gdb-stop.json', 'gdb-failure.json'):
         (output / stale).unlink(missing_ok=True)
 
-    esp = build_esp(root, kernel, output, args.qemu_memory_mib, args.platform_compatible)
-    command = ['python3', str(root / 'scripts/qemu-entry/gdb-stop.py'), hex(stop),
-               '--fixture', str(output), '--esp', str(esp), '--kernel', str(kernel),
-               '--system-registers', '--timeout', str(args.timeout),
-               '--qemu-accel', 'tcg', '--qemu-memory-mib', str(args.qemu_memory_mib)]
-    for request in requests:
-        command += ['--read-memory', request]
-    print('running:', ' '.join(command))
-    result = subprocess.run(command)
+    registers_needed = ('TCR_EL1', 'SCTLR_EL1', 'TTBR0_EL1', 'TTBR1_EL1')
+
+    # TCG is the only accelerator the macOS runners allow here: HVF is not
+    # available to them, so the guest emulates every arm64 instruction of EDK II,
+    # UniXNU and DarwinBoot before XNU starts. The deadline therefore has to be
+    # tens of minutes, and the serial log is what shows the guest is advancing.
+    report, fixture = run_guest(root, kernel, output, args.accel, args.timeout,
+                                args.qemu_memory_mib, args.platform_compatible,
+                                stop, requests)
+
+    # The fixture dies with the runner, so keep what the guest itself said.
+    if args.log_dir:
+        args.log_dir.mkdir(parents=True, exist_ok=True)
+        for name in ('gdb-uart.log', 'gdb-stop.json', 'gdb-failure.json'):
+            source = fixture / name
+            if source.is_file():
+                target = args.log_dir / f'snapshot-{name}'
+                shutil.copyfile(source, target)
+                # Only *.log reaches the uploaded artifact, so mirror the JSON
+                # reports as text: a serial tail cannot explain a stop alone.
+                if source.suffix == '.json':
+                    shutil.copyfile(source, target.with_suffix('.json.log'))
+
+    problem = 'gdb-stop wrote no report' if report is None else judge(
+        report, requests, registers_needed)
+    if not problem and report.get('kernel_sha256') != derived['plan']['candidate_sha256']:
+        problem = 'the snapshot identifies a different kernel than the audit checks'
+    if problem:
+        describe_serial(fixture)
+        raise SystemExit(problem)
+
+    # The audit reads exactly this path.
     report_path = output / 'gdb-stop.json'
-    if result.returncode or not report_path.is_file():
-        failure = output / 'gdb-failure.json'
-        if failure.is_file():
-            print(failure.read_text(), file=sys.stderr)
-        raise SystemExit(f'gdb-stop did not produce {report_path} (exit {result.returncode})')
+    shutil.copyfile(fixture / 'gdb-stop.json', report_path)
 
-    report = json.loads(report_path.read_text())
-    memory = report.get('memory') or {}
-    missing = [request for request in requests if request not in memory]
-    if missing:
-        raise SystemExit(f'the snapshot lacks {", ".join(missing)}: '
-                         f'the guest stopped before IOKit initialised these metaclasses')
-    if report.get('bounded_timeout_interrupted'):
-        raise SystemExit('the guest hit its deadline before the breakpoint: raise --timeout')
-    if report.get('kernel_sha256') != derived['plan']['candidate_sha256']:
-        raise SystemExit('the snapshot identifies a different kernel than the audit will check')
-
-    registers = report.get('system_registers') or {}
-    needed = ('TCR_EL1', 'SCTLR_EL1', 'TTBR0_EL1', 'TTBR1_EL1')
-    absent = [name for name in needed if name not in registers]
-    if absent:
-        raise SystemExit(f'the snapshot lacks {", ".join(absent)}')
+    registers, memory = report['system_registers'], report['memory']
     tcr = int(registers['TCR_EL1'], 16)
-    print(f'TCR_EL1 {registers["TCR_EL1"]} (T0SZ={tcr >> 14 & 3}, TG0={tcr >> 30 & 3})')
+    print(f'{args.accel}: TCR_EL1 {registers["TCR_EL1"]} (T0SZ={tcr >> 14 & 3}, TG0={tcr >> 30 & 3})')
+    print(f'{args.accel}: TTBR0_EL1 {registers["TTBR0_EL1"]}  TTBR1_EL1 {registers["TTBR1_EL1"]}')
+    uart = fixture / 'gdb-uart.log'
+    if uart.is_file() and uart.stat().st_size:
+        lines = uart.read_bytes().decode(errors='replace').splitlines()
+        print(f'guest serial: {len(lines)} lines')
+        for line in lines[-15:]:
+            print(f'  | {line}')
     print(f'memory slots captured: {len(memory)}')
     print(f'PASS: {report_path}')
     print(f'      storage metaclass {memory[requests[0]][:32]}...')
