@@ -359,8 +359,12 @@ jobs:
           #   ShengHidInput, AppleKeyStoreState  build-sheng-hid-input.py and its peers
           #              stop with "No reference candidate available"
           # Stage 1 needs none of them: it only has to reach IOKit initialisation.
+          #   ShengUfs  derives from the original IOBlockStorageDevice (only the prelink
+          #             step supplies it) and references _boot_progress_poll plus the
+          #             VerifiedRoot entry points, so it cannot link into this kernel
+          # Stage 1 needs none of them: it only has to reach IOKit initialisation.
           drop_components = {'Adreno740', 'AdrenoMetal', 'AirNir',
-                             'ShengHidInput', 'AppleKeyStoreState'}
+                             'ShengHidInput', 'AppleKeyStoreState', 'ShengUfs'}
 
           def keep(value):
               if value.startswith('component:'):
