@@ -465,13 +465,26 @@ jobs:
           WORK: ${{ steps.select.outputs.work }}
         run: |
           set -euo pipefail
-          TREE="$WORK/tree"
-          if [ ! -f "$TREE/build/xnu-prelink/native-apfs-load-positive.macho" ]; then
-            echo '::warning::no native-apfs-load-positive prelink candidate in the tree;'
-            echo 'the snapshot generator needs one, so the kernel step will need snapshot_url'
+          # The audit derivation needs the stage-1 tree: that is where the XNU compile
+          # records (IOPlatformExpert.cpo.json) and the .cache/xnu-work directory the
+          # reference object is built in both live. Stage 2 has produced neither yet.
+          BRINGUP_TREE="$(dirname "$WORK")/sheng_bringup/tree"
+          if [ ! -f "$BRINGUP_TREE/build/xnu-prelink/native-apfs-load-positive.macho" ]; then
+            echo '::warning::no native-apfs-load-positive prelink candidate; the generator needs one'
             exit 0
           fi
-          python3 "$GITHUB_WORKSPACE/.github/scripts/make-storage-snapshot.py" --root "$TREE"
+          if [ ! -f "$BRINGUP_TREE/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json" ]; then
+            echo "::error::stage-1 produced no IOPlatformExpert compile record in $BRINGUP_TREE"
+            exit 1
+          fi
+          # The snapshot ESP needs UniXNU.efi, which the package step wrote under WORK.
+          ln -sfn "$WORK/package" "$(dirname "$BRINGUP_TREE")/package"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/make-storage-snapshot.py" --root "$BRINGUP_TREE"
+          # Hand the result to the stage-2 tree, where the audit will look for it.
+          mkdir -p "$WORK/tree/build"
+          rm -rf "$WORK/tree/build/darwinboot-storage-native-metadata"
+          cp -R "$BRINGUP_TREE/build/darwinboot-storage-native-metadata" "$WORK/tree/build/"
+          ls -l "$WORK/tree/build/darwinboot-storage-native-metadata/"
 
       # Checked only after both the injected archive and the generator have run.
       - name: Verify the qualification snapshot
