@@ -331,16 +331,9 @@ jobs:
           BRINGUP_NAME="${BRINGUP_NAME%_defconfig}"
           BRINGUP_WORK="$(dirname "$WORK")/$BRINGUP_NAME"
           echo "stage-1 work: $BRINGUP_WORK"
-          # build-boot-progress.py compiles kits/sheng/BootProgress.c, which includes
-          # Font.h from the firmware checkout, so that tree must expose uefi-sheng.
+          # Expose the firmware checkout inside the stage-1 tree, as the full build does.
           mkdir -p "$BRINGUP_WORK/tree"
           ln -sfn "$UEFI_DIR" "$BRINGUP_WORK/tree/uefi-sheng"
-          FONT="$BRINGUP_WORK/tree/uefi-sheng/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/Font.h"
-          if [ ! -f "$FONT" ]; then
-            echo "::error::Font.h is missing from the firmware checkout at $FONT"
-            exit 1
-          fi
-          echo "Font.h present: $FONT"
           python3 - "$DEVICE_DIR/board.toml" <<'PY'
           import re
           import sys
@@ -356,7 +349,6 @@ jobs:
               'build-corecrypto-14.py --namespace',
               'build-software-aes-bindings.py',
               'build-mockfs-fixture.py',
-              'build-boot-progress.py',
               'build-libpthread-kernel.py',
           }
 
