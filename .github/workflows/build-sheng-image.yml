@@ -485,9 +485,12 @@ jobs:
           # runs. Its toolchain search stops at $ROOT/../toolchain and $ROOT/.cache/
           # toolchain, but the toolchain belongs to the stage-2 work directory (the
           # package step created it there), so point CLANG_BIN at it directly.
-          export CLANG_BIN="$WORK/toolchain"
-          if [ ! -x "$CLANG_BIN/clang" ]; then
-            echo "::error::no clang in $CLANG_BIN; the package step should have created it"
+          # EDK II treats CLANG_BIN as a directory prefix and appends tool names without a
+          # separator, which is why build-darwinboot.sh defaults to a trailing slash.
+          # Without it the compiler path becomes .../toolchainclang.
+          export CLANG_BIN="$WORK/toolchain/"
+          if [ ! -x "${CLANG_BIN%/}/clang" ]; then
+            echo "::error::no clang under ${CLANG_BIN%/}; the package step should have created it"
             exit 1
           fi
           echo "CLANG_BIN=$CLANG_BIN"
