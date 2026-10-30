@@ -360,10 +360,15 @@ jobs:
               'build-libpthread-kernel.py',
           }
 
-          # Adreno740 does not compile under this configuration: NativeAdrenoService.cpp
-          # declares ring/fence/SQE locals that nothing reads yet, and build-arm-driver.py
-          # passes -Werror. Stage 1 needs no GPU, so the component and its dependants go.
-          drop_components = {'Adreno740', 'AdrenoMetal', 'AirNir'}
+          # Components whose builder needs a qualification artifact stage 1 cannot have,
+          # or that do not compile under this configuration:
+          #   Adreno740  NativeAdrenoService.cpp declares ring/fence/SQE locals nothing
+          #              reads yet and build-arm-driver.py passes -Werror
+          #   ShengHidInput, AppleKeyStoreState  build-sheng-hid-input.py and its peers
+          #              stop with "No reference candidate available"
+          # Stage 1 needs none of them: it only has to reach IOKit initialisation.
+          drop_components = {'Adreno740', 'AdrenoMetal', 'AirNir',
+                             'ShengHidInput', 'AppleKeyStoreState'}
 
           def keep(value):
               if value.startswith('component:'):
