@@ -173,8 +173,11 @@ jobs:
             brew install unifdef
             echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
           fi
+          # scripts/qemu-entry/gdb-stop.py boots the candidate under qemu-system-aarch64
+          # to read the metaclasses, so the emulator is a build dependency here.
+          brew install qemu
           export PATH="$(brew --prefix llvm)/bin:$PATH"
-          for tool in clang ld.lld dtc fdtget fdtput mformat mcopy make; do
+          for tool in clang ld.lld dtc fdtget fdtput mformat mcopy make qemu-system-aarch64; do
             command -v "$tool" >/dev/null || { echo "::error::$tool is missing"; exit 1; }
           done
 
