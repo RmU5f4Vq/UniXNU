@@ -306,6 +306,77 @@ jobs:
       # storage ABI has been qualified on a running kernel: prepare-storage-headers.py
       # deliberately stops at the headers, and no script in the repositories writes
       # build/storage-abi/interface-audit.json. Supply those artifacts here.
+      # Stage 1 of the two-phase build. audit-storage-interface.py needs a prelink
+      # candidate, and the candidate needs the audit, so the loop has to be broken
+      # with a kernel that links without it: sheng_bringup_defconfig turns off every
+      # switch that reaches into the storage ABI, and the archives list is narrowed to
+      # the builders that need no qualification. The candidate is only ever used to
+      # take the QEMU snapshot.
+      - name: Stage 1 - build the bring-up kernel
+        env:
+          WORK: ${{ steps.select.outputs.work }}
+        run: |
+          set -euo pipefail
+          BRINGUP="$DEVICE_DIR/configs/sheng_bringup_defconfig"
+          if [ ! -f "$BRINGUP" ]; then
+            echo "::error::device repository has no configs/sheng_bringup_defconfig"
+            exit 1
+          fi
+          python3 - "$DEVICE_DIR/board.toml" <<'PY'
+          import sys
+          from pathlib import Path
+
+          keep = {
+              'build-corecrypto-14.py', 'build-corecrypto-14.py --namespace',
+              'component:ArmDTPlatform', 'component:ArmCpu', 'component:SoftwareAES',
+              'build-software-aes-bindings.py', 'component:ShengUfs',
+              'build-mockfs-fixture.py', 'build-boot-progress.py',
+              'build-libpthread-kernel.py',
+          }
+          path = Path(sys.argv[1])
+          source = path.read_text()
+          path.with_suffix('.toml.full').write_text(source)
+          out, inside, dropped = [], False, []
+          for line in source.splitlines():
+              text = line.strip()
+              if text.startswith('"archives"'):
+                  inside = True
+                  out.append(line)
+                  continue
+              if inside:
+                  if text.startswith(']'):
+                      inside = False
+                      out.append(line)
+                      continue
+                  value = text.rstrip(',').strip('"')
+                  if value in keep:
+                      out.append(line)
+                  else:
+                      dropped.append(value)
+                  continue
+              out.append(line)
+          text = '\n'.join(out) + '\n'
+          text = text.replace('"defconfig" = "sheng_defconfig"', '"defconfig" = "sheng_bringup_defconfig"')
+          path.write_text(text)
+          print(f'archives kept {len(keep)}, dropped {len(dropped)}:')
+          for value in dropped:
+              print(f'  - {value}')
+          PY
+          ./unixnu defconfig sheng_bringup_defconfig -D "$DEVICE_DIR"
+          ./unixnu build kernel -D "$DEVICE_DIR" --ipsw "${IPSW:-$PINNED_IPSW_URL}"
+          mkdir -p "$WORK/tree/build/xnu-prelink"
+          cp "$WORK/kernel/kernel.macho" "$WORK/tree/build/xnu-prelink/native-apfs-load-positive.macho"
+          report=$(ls "$WORK"/kernel/*.json 2>/dev/null | head -1 || true)
+          if [ -z "$report" ]; then
+            echo '::error::the prelink step wrote no report next to kernel.macho'
+            exit 1
+          fi
+          cp "$report" "$WORK/tree/build/xnu-prelink/native-apfs-load-positive.json"
+          echo "candidate: $WORK/tree/build/xnu-prelink/native-apfs-load-positive.macho"
+          ls -l "$WORK/tree/build/xnu-prelink/"
+          # Restore the full board file so the stage-2 kernel uses sheng_defconfig.
+          mv "$DEVICE_DIR/board.toml.full" "$DEVICE_DIR/board.toml"
+
       - name: Inject the qualification snapshot
         id: snapshot
         env:
