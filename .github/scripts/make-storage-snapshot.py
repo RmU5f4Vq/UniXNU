@@ -157,7 +157,8 @@ def main():
                         help='prelink candidate (default: build/xnu-prelink/native-apfs-load-positive.macho)')
     parser.add_argument('--output', type=Path,
                         help='output directory (default: build/darwinboot-storage-native-metadata)')
-    parser.add_argument('--timeout', type=float, default=180.0, help='guest deadline in seconds')
+    parser.add_argument('--timeout', type=float, default=280.0,
+                        help='guest deadline in seconds; TCG emulation needs minutes to reach IOKit')
     parser.add_argument('--qemu-memory-mib', type=int, choices=[1024, 2048, 4096, 8192], default=1024)
     parser.add_argument('--platform-compatible', default='xiaomi,sheng',
                         help='DT platform compatible string for QEMU (empty to omit)')
