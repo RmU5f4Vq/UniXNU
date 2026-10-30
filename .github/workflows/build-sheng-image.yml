@@ -326,13 +326,11 @@ jobs:
           import sys
           from pathlib import Path
 
-          keep = {
-              'build-corecrypto-14.py', 'build-corecrypto-14.py --namespace',
-              'component:ArmDTPlatform', 'component:ArmCpu', 'component:SoftwareAES',
-              'build-software-aes-bindings.py', 'component:ShengUfs',
-              'build-mockfs-fixture.py', 'build-boot-progress.py',
-              'build-libpthread-kernel.py',
-          }
+          # Only the two bindings builders read build/storage-abi/interface-audit.json.
+          # Every component: entry stays: unixnu refuses a board whose [components]
+          # include names no archive entry, and compiling those drivers is harmless
+          # when their CONFIG switches are off.
+          skip = ('build-virtio-mmio-bindings.py',)
           path = Path(sys.argv[1])
           source = path.read_text()
           path.with_suffix('.toml.full').write_text(source)
@@ -349,16 +347,16 @@ jobs:
                       out.append(line)
                       continue
                   value = text.rstrip(',').strip('"')
-                  if value in keep:
-                      out.append(line)
-                  else:
+                  if value.startswith(skip):
                       dropped.append(value)
+                  else:
+                      out.append(line)
                   continue
               out.append(line)
           text = '\n'.join(out) + '\n'
           text = text.replace('"defconfig" = "sheng_defconfig"', '"defconfig" = "sheng_bringup_defconfig"')
           path.write_text(text)
-          print(f'archives kept {len(keep)}, dropped {len(dropped)}:')
+          print(f'archives dropped {len(dropped)}:')
           for value in dropped:
               print(f'  - {value}')
           PY
