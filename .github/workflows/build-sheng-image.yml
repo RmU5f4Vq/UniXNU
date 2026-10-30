@@ -409,18 +409,20 @@ jobs:
           PY
           ./unixnu defconfig sheng_bringup_defconfig -D "$DEVICE_DIR"
           ./unixnu build kernel -D "$DEVICE_DIR" --ipsw "${IPSW:-$PINNED_IPSW_URL}"
-          # The snapshot generator reads the tree of the configuration it is given, so
-          # the candidate goes into the stage-2 tree that later steps use.
-          mkdir -p "$WORK/tree/build/xnu-prelink"
-          cp "$BRINGUP_WORK/kernel/kernel.macho" "$WORK/tree/build/xnu-prelink/native-apfs-load-positive.macho"
           report=$(ls "$BRINGUP_WORK"/kernel/*.json 2>/dev/null | head -1 || true)
           if [ -z "$report" ]; then
             echo '::error::the prelink step wrote no report next to kernel.macho'
             exit 1
           fi
-          cp "$report" "$WORK/tree/build/xnu-prelink/native-apfs-load-positive.json"
-          echo "candidate: $WORK/tree/build/xnu-prelink/native-apfs-load-positive.macho"
-          ls -l "$WORK/tree/build/xnu-prelink/"
+          # Two trees need the candidate: the generator reads the stage-1 tree (that is
+          # where the compile records live), and the audit later reads the stage-2 tree.
+          for dest in "$BRINGUP_WORK/tree" "$WORK/tree"; do
+            mkdir -p "$dest/build/xnu-prelink"
+            cp "$BRINGUP_WORK/kernel/kernel.macho" "$dest/build/xnu-prelink/native-apfs-load-positive.macho"
+            cp "$report" "$dest/build/xnu-prelink/native-apfs-load-positive.json"
+          done
+          echo "candidate report: $report"
+          ls -l "$BRINGUP_WORK/tree/build/xnu-prelink/" "$WORK/tree/build/xnu-prelink/"
           # Restore the full board file so the stage-2 kernel uses sheng_defconfig.
           mv "$DEVICE_DIR/board.toml.full" "$DEVICE_DIR/board.toml"
 
