@@ -684,7 +684,10 @@ jobs:
           python3 - <<'PY'
           import json, os, re, shutil
           from pathlib import Path
-          source = Path(os.environ['WORK']) / 'logs'
+          work = Path(os.environ['WORK'])
+          # Stage 1 builds under its own sibling directory (sheng_bringup), so every
+          # work directory of this configuration contributes logs, not only WORK.
+          sources = [work / 'logs'] + sorted(p for p in work.parent.glob('*/logs') if p != work / 'logs')
           target = Path(os.environ['RUNNER_TEMP']) / 'public-logs'
           shutil.rmtree(target, ignore_errors=True)
           target.mkdir(parents=True)
@@ -695,17 +698,22 @@ jobs:
                      inputs.get('data_seed_url', '')]
           secrets = [value for value in secrets if value]
           count = 0
-          for path in sorted(source.glob('*.log')) if source.is_dir() else []:
-              data = path.read_bytes()
-              if b'\0' in data:
+          for source in sources:
+              if not source.is_dir():
                   continue
-              text = data.decode('utf-8', 'replace')
-              for value in secrets:
-                  text = text.replace(value, '***')
-              text = re.sub(r'https?://[^\s"\']*[?&](?:token|sig|signature|key|X-Amz-Signature)=[^\s"\']*', '***', text, flags=re.I)
-              (target / path.name).write_text(text)
-              count += 1
-          print(f'{count} text logs staged')
+              prefix = '' if source.parent == work else source.parent.name + '-'
+              for path in sorted(source.glob('*.log')):
+                  data = path.read_bytes()
+                  if b'\0' in data:
+                      continue
+                  text = data.decode('utf-8', 'replace')
+                  for value in secrets:
+                      text = text.replace(value, '***')
+                  text = re.sub(r'https?://[^\s"\']*[?&](?:token|sig|signature|key|X-Amz-Signature)=[^\s"\']*', '***', text, flags=re.I)
+                  (target / (prefix + path.name)).write_text(text)
+                  count += 1
+                  print(f'  {prefix + path.name}: {len(text)} bytes')
+          print(f'{count} text logs staged from {len(sources)} work directories')
           PY
 
       - name: Upload the logs
