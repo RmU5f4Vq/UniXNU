@@ -335,7 +335,7 @@ jobs:
             echo "::error::Font.h is missing from the firmware checkout at $FONT"
             exit 1
           fi
-          echo "Font.h present: $FONT
+          echo "Font.h present: $FONT"
           python3 - "$DEVICE_DIR/board.toml" <<'PY'
           import sys
           from pathlib import Path
