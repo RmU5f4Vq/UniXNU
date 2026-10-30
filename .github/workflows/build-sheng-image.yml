@@ -315,6 +315,9 @@ jobs:
       - name: Stage 1 - build the bring-up kernel
         env:
           WORK: ${{ steps.select.outputs.work }}
+          # prepare-xnu-source.py lists Apple sources through the GitHub API;
+          # anonymous calls from hosted runners hit the shared rate limit (403).
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           BRINGUP="$DEVICE_DIR/configs/sheng_bringup_defconfig"
