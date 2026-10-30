@@ -325,6 +325,17 @@ jobs:
             echo "::error::device repository has no configs/sheng_bringup_defconfig"
             exit 1
           fi
+          # build-boot-progress.py compiles kits/sheng/BootProgress.c, which includes
+          # Font.h from the firmware checkout. The tree has to expose uefi-sheng at
+          # this point, not only before the stage-2 firmware step.
+          mkdir -p "$WORK/tree"
+          ln -sfn "$UEFI_DIR" "$WORK/tree/uefi-sheng"
+          FONT="$WORK/tree/uefi-sheng/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/Font.h"
+          if [ ! -f "$FONT" ]; then
+            echo "::error::Font.h is missing from the firmware checkout at $FONT"
+            exit 1
+          fi
+          echo "Font.h present: $FONT
           python3 - "$DEVICE_DIR/board.toml" <<'PY'
           import sys
           from pathlib import Path
