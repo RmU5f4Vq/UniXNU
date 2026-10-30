@@ -70,8 +70,32 @@ def darwinboot(root):
     script = root / 'scripts/build-darwinboot.sh'
     if not script.is_file():
         raise SystemExit('DarwinBoot.efi is missing and scripts/build-darwinboot.sh is absent')
+
+    # build-darwinboot.sh drives EDK II but never builds BaseTools, and it assumes
+    # GenFw is already there. Build it first when the tree has only the sources.
+    tools = root / 'refer/edk2' / 'BaseTools'
+    if not (tools / 'MdePkg').exists() and (root / 'package/Mu_Basecore/BaseTools').is_dir():
+        tools = root / 'package/Mu_Basecore/BaseTools'
+    if (tools / 'Source/C').is_dir() and not (tools / 'Source/C/bin/GenFw').is_file():
+        print(f'BaseTools have no GenFw yet: building {tools / "Source/C"}')
+        built = subprocess.run(['make', '-C', str(tools / 'Source/C'), f'-j{os.cpu_count() or 4}'],
+                               capture_output=True, text=True)
+        if built.returncode:
+            print(built.stdout[-4000:], file=sys.stderr)
+            print(built.stderr[-4000:], file=sys.stderr)
+            raise SystemExit('building BaseTools failed')
+
     print('DarwinBoot.efi is missing: building it with scripts/build-darwinboot.sh')
-    subprocess.run(['bash', str(script)], cwd=root, check=True)
+    print(f'  CLANG_BIN={os.environ.get("CLANG_BIN", "(unset)")}')
+    print(f'  BaseTools={tools}')
+    built = subprocess.run(['bash', str(script)], cwd=root, capture_output=True, text=True)
+    if built.returncode:
+        # The script's own output is the only way to see which tool EDK II could not run.
+        print('--- build-darwinboot.sh stdout ---', file=sys.stderr)
+        print(built.stdout[-8000:], file=sys.stderr)
+        print('--- build-darwinboot.sh stderr ---', file=sys.stderr)
+        print(built.stderr[-8000:], file=sys.stderr)
+        raise SystemExit(f'scripts/build-darwinboot.sh exited {built.returncode}')
     found = locate()
     if not found:
         raise SystemExit('DarwinBoot.efi is still missing after scripts/build-darwinboot.sh')
