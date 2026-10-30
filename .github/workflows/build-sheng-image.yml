@@ -481,7 +481,21 @@ jobs:
           fi
           # The snapshot ESP needs UniXNU.efi, which the package step wrote under WORK.
           ln -sfn "$WORK/package" "$(dirname "$BRINGUP_TREE")/package"
-          python3 "$GITHUB_WORKSPACE/.github/scripts/make-storage-snapshot.py" --root "$BRINGUP_TREE"
+          # DarwinBoot.efi comes from the EDK II build that scripts/build-darwinboot.sh
+          # runs. Its toolchain search stops at $ROOT/../toolchain and $ROOT/.cache/
+          # toolchain, but the toolchain belongs to the stage-2 work directory (the
+          # package step created it there), so point CLANG_BIN at it directly.
+          export CLANG_BIN="$WORK/toolchain"
+          if [ ! -x "$CLANG_BIN/clang" ]; then
+            echo "::error::no clang in $CLANG_BIN; the package step should have created it"
+            exit 1
+          fi
+          echo "CLANG_BIN=$CLANG_BIN"
+          # tee the generator output into the logs directory so a failure is also
+          # visible in the uploaded artifact, not only in the live job console.
+          mkdir -p "$WORK/logs"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/make-storage-snapshot.py" --root "$BRINGUP_TREE" 2>&1 \
+            | tee "$WORK/logs/snapshot.log"
           # Hand the result to the stage-2 tree, where the audit will look for it.
           mkdir -p "$WORK/tree/build"
           rm -rf "$WORK/tree/build/darwinboot-storage-native-metadata"
