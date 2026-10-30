@@ -68,6 +68,10 @@ on:
         description: Continue without the qualification artifacts instead of stopping
         type: boolean
         default: false
+      qemu_guest_seconds:
+        description: TCG deadline for the QEMU/GDB storage snapshot (whole macOS job is capped at 6 h)
+        required: false
+        default: '1800'
       publish_release:
         description: Publish the images to a GitHub release
         type: boolean
@@ -465,9 +469,15 @@ jobs:
       # script writes; make-storage-snapshot.py produces it by reusing the audit's
       # own metaclass derivation. It needs a prelink candidate, so it only runs when
       # one is already present in the tree.
+      # The guest runs under TCG, the only accelerator the runners allow, so every
+      # arm64 instruction of EDK II, UniXNU and DarwinBoot is emulated before XNU
+      # starts. qemu_guest_seconds is the deadline for that; the generator prints the
+      # guest serial tail every 15 s, which is what shows how far the boot got.
       - name: Generate the qualification snapshot
+        timeout-minutes: 60
         env:
           WORK: ${{ steps.select.outputs.work }}
+          QEMU_GUEST_SECONDS: ${{ inputs.qemu_guest_seconds || 1800 }}
         run: |
           set -euo pipefail
           # The audit derivation needs the stage-1 tree: that is where the XNU compile
@@ -500,7 +510,8 @@ jobs:
           # tee the generator output into the logs directory so a failure is also
           # visible in the uploaded artifact, not only in the live job console.
           mkdir -p "$WORK/logs"
-          python3 "$GITHUB_WORKSPACE/.github/scripts/make-storage-snapshot.py" --root "$BRINGUP_TREE" 2>&1 \
+          python3 "$GITHUB_WORKSPACE/.github/scripts/make-storage-snapshot.py" --root "$BRINGUP_TREE" \
+            --timeout "$QEMU_GUEST_SECONDS" --log-dir "$WORK/logs" 2>&1 \
             | tee "$WORK/logs/snapshot.log"
           # Hand the result to the stage-2 tree, where the audit will look for it.
           mkdir -p "$WORK/tree/build"
