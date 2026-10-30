@@ -60,6 +60,14 @@ on:
         description: Skip the board preflight check in the firmware step
         type: boolean
         default: false
+      snapshot_url:
+        description: Qualification snapshot URL (zip of build/ artifacts the kernel archives need)
+        required: false
+        default: ''
+      allow_missing_snapshot:
+        description: Continue without the qualification artifacts instead of stopping
+        type: boolean
+        default: false
       publish_release:
         description: Publish the images to a GitHub release
         type: boolean
@@ -290,14 +298,94 @@ jobs:
           python3 scripts/fetch-sheng-dts.py
           ls -l build/sheng/sheng.dtb
 
+      # The snapshot ESP carries UniXNU.efi, so the package comes before the kernel.
+      - name: Build the UEFI package
+        run: ./unixnu build package -D "$DEVICE_DIR"
+
+      # sheng's kernel archives link against artifacts that only exist after the
+      # storage ABI has been qualified on a running kernel: prepare-storage-headers.py
+      # deliberately stops at the headers, and no script in the repositories writes
+      # build/storage-abi/interface-audit.json. Supply those artifacts here.
+      - name: Inject the qualification snapshot
+        id: snapshot
+        env:
+          SNAPSHOT: ${{ inputs.snapshot_url }}
+          ALLOW_MISSING: ${{ inputs.allow_missing_snapshot }}
+          WORK: ${{ steps.select.outputs.work }}
+        run: |
+          set -euo pipefail
+          TREE="$WORK/tree"
+          if [ -n "$SNAPSHOT" ]; then
+            echo "::add-mask::$SNAPSHOT"
+            curl -fsSL --retry 3 "$SNAPSHOT" -o "$RUNNER_TEMP/snapshot.zip"
+            python3 - "$RUNNER_TEMP/snapshot.zip" "$TREE" <<'PY'
+          import sys, zipfile
+          from pathlib import Path
+          archive, tree = sys.argv[1], Path(sys.argv[2])
+          root = tree / 'build'
+          root.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(archive) as z:
+              for name in z.namelist():
+                  if name.endswith('/'):
+                      continue
+                  parts = Path(name).parts
+                  if '..' in parts or name.startswith('/'):
+                      sys.exit(f'::error::unsafe path in the snapshot: {name}')
+                  target = root / name
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(z.read(name))
+                  print(f'injected {name}: {target.stat().st_size} bytes')
+          PY
+          fi
+          python3 - "$TREE" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          root = Path(sys.argv[1]) / 'build'
+          required = {
+              'storage ABI audit': 'storage-abi/interface-audit.json',
+              'live storage metadata': 'darwinboot-storage-native-metadata/gdb-stop.json',
+              'AES interface audit': 'image4-ignition/aes-interface-audit.json',
+              'verified root archive': 'verified-root-os-xnu-bundle/libVerifiedRootProbe.a',
+          }
+          missing = {k: v for k, v in required.items() if not (root / v).is_file()}
+          allow = os.environ.get('ALLOW_MISSING', 'false').lower() == 'true'
+          if missing:
+              print('missing qualification artifacts:')
+              for name, rel in missing.items():
+                  print(f'  {name:<24} build/{rel}')
+              if allow:
+                  print('::warning::continuing without them; the kernel archives will fail at link')
+              else:
+                  sys.exit('::error::supply snapshot_url with these files, or set allow_missing_snapshot')
+          else:
+              print('all qualification artifacts present')
+              for name, rel in required.items():
+                  print(f'  {name:<24} build/{rel}')
+          PY
+
+
+      # audit-storage-interface.py consumes a QEMU/GDB snapshot that no repository
+      # script writes; make-storage-snapshot.py produces it by reusing the audit's
+      # own metaclass derivation. It needs a prelink candidate, so it only runs when
+      # one is already present in the tree.
+      - name: Generate the qualification snapshot
+        env:
+          WORK: ${{ steps.select.outputs.work }}
+        run: |
+          set -euo pipefail
+          TREE="$WORK/tree"
+          if [ ! -f "$TREE/build/xnu-prelink/native-apfs-load-positive.macho" ]; then
+            echo '::warning::no native-apfs-load-positive prelink candidate in the tree;'
+            echo 'the snapshot generator needs one, so the kernel step will need snapshot_url'
+            exit 0
+          fi
+          python3 "$GITHUB_WORKSPACE/.github/scripts/make-storage-snapshot.py" --root "$TREE"
+
       - name: Build the kernel
         env:
           IPSW: ${{ inputs.ipsw_url || env.PINNED_IPSW_URL }}
           GITHUB_TOKEN: ${{ github.token }}
         run: ./unixnu build kernel -D "$DEVICE_DIR" --ipsw "$IPSW"
-
-      - name: Build the UEFI package
-        run: ./unixnu build package -D "$DEVICE_DIR"
 
       # check-sheng.py resolves uefi-sheng and the compiled DTB relative to the
       # tree, so expose both there before the firmware step runs it.
