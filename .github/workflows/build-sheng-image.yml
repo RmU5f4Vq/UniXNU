@@ -326,11 +326,22 @@ jobs:
           import sys
           from pathlib import Path
 
-          # Only the two bindings builders read build/storage-abi/interface-audit.json.
           # Every component: entry stays: unixnu refuses a board whose [components]
-          # include names no archive entry, and compiling those drivers is harmless
-          # when their CONFIG switches are off.
-          skip = ('build-virtio-mmio-bindings.py',)
+          # include names no archive entry, and build-arm-driver.py needs no
+          # qualification artifacts. Of the build-*.py builders only these five are
+          # self-contained; the rest reach for a reference candidate or the storage
+          # ABI audit, and their CONFIG switches are off in this configuration.
+          keep_build = {
+              'build-corecrypto-14.py',
+              'build-corecrypto-14.py --namespace',
+              'build-software-aes-bindings.py',
+              'build-mockfs-fixture.py',
+              'build-boot-progress.py',
+              'build-libpthread-kernel.py',
+          }
+
+          def keep(value):
+              return not value.startswith('build-') or value in keep_build
           path = Path(sys.argv[1])
           source = path.read_text()
           path.with_suffix('.toml.full').write_text(source)
@@ -347,10 +358,10 @@ jobs:
                       out.append(line)
                       continue
                   value = text.rstrip(',').strip('"')
-                  if value.startswith(skip):
-                      dropped.append(value)
-                  else:
+                  if keep(value):
                       out.append(line)
+                  else:
+                      dropped.append(value)
                   continue
               out.append(line)
           text = '\n'.join(out) + '\n'
