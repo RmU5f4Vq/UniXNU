@@ -342,6 +342,7 @@ jobs:
           fi
           echo "Font.h present: $FONT"
           python3 - "$DEVICE_DIR/board.toml" <<'PY'
+          import re
           import sys
           from pathlib import Path
 
@@ -359,7 +360,14 @@ jobs:
               'build-libpthread-kernel.py',
           }
 
+          # Adreno740 does not compile under this configuration: NativeAdrenoService.cpp
+          # declares ring/fence/SQE locals that nothing reads yet, and build-arm-driver.py
+          # passes -Werror. Stage 1 needs no GPU, so the component and its dependants go.
+          drop_components = {'Adreno740', 'AdrenoMetal', 'AirNir'}
+
           def keep(value):
+              if value.startswith('component:'):
+                  return value.split(':', 1)[1] not in drop_components
               return not value.startswith('build-') or value in keep_build
           path = Path(sys.argv[1])
           source = path.read_text()
@@ -384,6 +392,14 @@ jobs:
                   continue
               out.append(line)
           text = '\n'.join(out) + '\n'
+          # [components] include has to match the archives list, so the same names leave it.
+          match = re.search(r'"include"\s*=\s*\[(.*?)\]', text, re.S)
+          if match:
+              names = [item.strip().strip('"') for item in match.group(1).split(',') if item.strip()]
+              kept_names = [name for name in names if name not in drop_components]
+              text = (text[:match.start()] + '"include" = [' +
+                      ', '.join(f'"{name}"' for name in kept_names) + ']' + text[match.end():])
+              print('components kept:', ', '.join(kept_names))
           text = text.replace('"defconfig" = "sheng_defconfig"', '"defconfig" = "sheng_bringup_defconfig"')
           path.write_text(text)
           print(f'archives dropped {len(dropped)}:')
