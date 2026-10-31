@@ -197,8 +197,13 @@ def sign_and_verify(root, name, dmg, compressed_sha, expected_uuid, dylib):
         if info.get('BusProtocol') != 'Disk Image' or info.get('Writable') is not False:
             raise Failure(f'{name}: the attachment must be a read-only disk image')
         total = info.get('TotalSize')
-        if not total or total % 4096:
-            raise Failure(f'{name}: virtual media size {total} is not 4 KiB aligned')
+        # TotalSize is the authenticated extent: exactly the OS volume, not the
+        # whole GPT disk. 6077580800 % 4096 == 1536, so the final block is short
+        # and manifest.make pads the hash table accordingly; the probe pins those
+        # sample lengths [4096, 4096, 4096, 1536]. Only 512-byte sectors are
+        # guaranteed here, not 4 KiB alignment.
+        if not total or total % 512:
+            raise Failure(f'{name}: virtual media size {total} is not sector aligned')
         volume_uuid = volume_info.get('VolumeUUID')
         if expected_uuid and str(volume_uuid).upper() != expected_uuid:
             raise Failure(f'{name}: volume UUID {volume_uuid} != expected {expected_uuid}')
