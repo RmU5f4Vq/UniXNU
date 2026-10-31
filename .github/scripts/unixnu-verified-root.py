@@ -29,6 +29,7 @@ import importlib.util
 import json
 from pathlib import Path
 import plistlib
+import re
 import shutil
 import stat
 import subprocess
@@ -143,16 +144,29 @@ def attach_readonly(dmg):
 
     Returns (raw_whole_disk, whole_disk_node, mount_point). diskutil wants the
     buffered /dev/diskN node while the block loop reads the raw /dev/rdiskN.
+
+    Two real layouts occur in this restore image. The OS member reports the whole
+    disk with content-hint GUID_partition_scheme. The Cryptex1,SystemOS member is
+    an APFS container: hdiutil reports the whole disk with the EFI type GUID
+    (EF57347C-…) and the mountable volume as diskNs1, with no GPT hint at all.
+    Derive the whole-disk node from the mounted volume's device entry instead of
+    matching hint strings.
     """
     result = run(['hdiutil', 'attach', '-readonly', '-nobrowse', '-plist', str(dmg)])
     document = plistlib.loads(result.stdout.encode())
     entities = document['system-entities']
-    whole = [e['dev-entry'] for e in entities if e.get('content-hint') == 'GUID_partition_scheme']
-    mounts = [e['mount-point'] for e in entities if e.get('mount-point')]
-    if len(whole) != 1 or len(mounts) != 1:
-        raise Failure(f'expected one GPT whole-disk and one mounted volume, got {entities}')
-    node = Path(whole[0])
-    return Path('/dev/r' + node.name), node, Path(mounts[0])
+    mounts = [e for e in entities if e.get('mount-point')]
+    if len(mounts) != 1:
+        raise Failure(f'expected exactly one mounted volume, got {entities}')
+    device = mounts[0]['dev-entry']
+    match = re.fullmatch(r'(/dev/disk\d+)s\d+', device)
+    if not match:
+        raise Failure(f'cannot derive the whole-disk node from {device}')
+    node = Path(match[1])
+    names = {e.get('dev-entry') for e in entities}
+    if str(node) not in names:
+        raise Failure(f'{node} is not among the attached entities: {sorted(names)}')
+    return Path('/dev/r' + node.name), node, Path(mounts[0]['mount-point'])
 
 
 def detach(disk):
