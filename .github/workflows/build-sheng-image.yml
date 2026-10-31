@@ -173,6 +173,10 @@ jobs:
         run: |
           set -euo pipefail
           brew install llvm lld mtools dtc
+          # kits/VerifiedRoot/tests/openssl_provider.c is built into the host
+          # verification dylib and needs OpenSSL 3 headers (openssl/param_build.h);
+          # macOS ships LibreSSL, which does not have them.
+          brew install openssl@3
           if ! command -v unifdef >/dev/null; then
             brew install unifdef
             echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
@@ -518,6 +522,50 @@ jobs:
           rm -rf "$WORK/tree/build/darwinboot-storage-native-metadata"
           cp -R "$BRINGUP_TREE/build/darwinboot-storage-native-metadata" "$WORK/tree/build/"
           ls -l "$WORK/tree/build/darwinboot-storage-native-metadata/"
+
+      # CONFIG_XNU_VERIFIED_ROOT_PROBE=y makes the stage-2 kernel force-load
+      # build/verified-root-os-xnu-bundle/libVerifiedRootProbe.a. Its upstream
+      # generator needs the two original IPSW members signed and block-verified
+      # under one owner key, plus a host dylib built from kits/VerifiedRoot.
+      # The DMGs are fetched through unixnu's own range-reading extractor, so the
+      # full restore image is never downloaded. This needs the stage-1 XNU compile
+      # record (bsd_init.o.json) that the probe reuses for its objects.
+      - name: Build the verified root probe archive
+        timeout-minutes: 90
+        env:
+          WORK: ${{ steps.select.outputs.work }}
+          IPSW: ${{ inputs.ipsw_url || env.PINNED_IPSW_URL }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BRINGUP_TREE="$(dirname "$WORK")/sheng_bringup/tree"
+          REC="$BRINGUP_TREE/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/bsd_init.o.json"
+          if [ ! -f "$REC" ]; then
+            echo "::error::$REC is missing; the stage-1 tree supplies the probe's compile record"
+            exit 1
+          fi
+          for f in scripts/build-verified-root-probe.py kits/VerifiedRoot/tools/manifest.py; do
+            [ -f "$BRINGUP_TREE/$f" ] || { echo "::error::$BRINGUP_TREE/$f missing; check unixnu fetch"; exit 1; }
+          done
+          cd "$BRINGUP_TREE"
+          # Out of tree, so no 7 GiB restore image: only the two named members.
+          ./unixnu ipsw fetch OS "Cryptex1,SystemOS" --ipsw "$IPSW" 2>&1 \
+            | tee "$WORK/logs/verified-root-ipsw.log"
+          # The extractor caches members under <out_root>/ipsw/<build>/; locate them
+          # by name instead of assuming how out_root relates to the tree directory.
+          OS_DMG="$(find "$(dirname "$WORK")" -name 044-76040-038.dmg -print -quit)"
+          SYS_DMG="$(find "$(dirname "$WORK")" -name 044-76034-038.dmg -print -quit)"
+          for d in "$OS_DMG" "$SYS_DMG"; do
+            [ -n "$d" ] && [ -f "$d" ] || { echo "::error::IPSW member not extracted: $d"; exit 1; }
+          done
+          python3 "$GITHUB_WORKSPACE/.github/scripts/unixnu-verified-root.py" \
+            --root "$BRINGUP_TREE" --os-dmg "$OS_DMG" --systemos-dmg "$SYS_DMG" 2>&1 \
+            | tee "$WORK/logs/verified-root.log"
+          # Publish to the stage-2 tree the same way the live snapshot is handed over.
+          mkdir -p "$WORK/tree/build"
+          rm -rf "$WORK/tree/build/verified-root-os-xnu-bundle"
+          cp -R "$BRINGUP_TREE/build/verified-root-os-xnu-bundle" "$WORK/tree/build/"
+          ls -l "$WORK/tree/build/verified-root-os-xnu-bundle/"
 
       # Checked only after both the injected archive and the generator have run.
       - name: Verify the qualification snapshot
