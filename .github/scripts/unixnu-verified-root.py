@@ -140,17 +140,16 @@ def load_verifier(dylib):
 
 
 def attach_readonly(dmg):
-    """Attach a UDIF read-only.
+    """Attach a UDIF read-only and return the pieces the verification needs.
 
-    Returns (raw_whole_disk, whole_disk_node, mount_point). diskutil wants the
-    buffered /dev/diskN node while the block loop reads the raw /dev/rdiskN.
+    Returns (whole_raw, whole_node, mount_point, volume_node). The whole-disk node
+    is only used for detaching; hashing must NOT use it.
 
-    Two real layouts occur in this restore image. The OS member reports the whole
-    disk with content-hint GUID_partition_scheme. The Cryptex1,SystemOS member is
-    an APFS container: hdiutil reports the whole disk with the EFI type GUID
-    (EF57347C-…) and the mountable volume as diskNs1, with no GPT hint at all.
-    Derive the whole-disk node from the mounted volume's device entry instead of
-    matching hint strings.
+    The authenticated extent is the mounted volume itself, and the whole disk is
+    larger by the partition-table sectors. On the OS member those two sizes differ
+    by 67 sectors (6077580800 vs 6077546496 bytes), which silently shifts every
+    block hash if the wrong node is read. Reading the volume's own device keeps
+    the extent exact for both members, whatever the partition layout is.
     """
     result = run(['hdiutil', 'attach', '-readonly', '-nobrowse', '-plist', str(dmg)])
     document = plistlib.loads(result.stdout.encode())
@@ -158,15 +157,15 @@ def attach_readonly(dmg):
     mounts = [e for e in entities if e.get('mount-point')]
     if len(mounts) != 1:
         raise Failure(f'expected exactly one mounted volume, got {entities}')
-    device = mounts[0]['dev-entry']
-    match = re.fullmatch(r'(/dev/disk\d+)s\d+', device)
+    volume = Path(mounts[0]['dev-entry'])
+    match = re.fullmatch(r'(/dev/disk\d+)s\d+', str(volume))
     if not match:
-        raise Failure(f'cannot derive the whole-disk node from {device}')
+        raise Failure(f'cannot derive the whole-disk node from {volume}')
     node = Path(match[1])
     names = {e.get('dev-entry') for e in entities}
     if str(node) not in names:
         raise Failure(f'{node} is not among the attached entities: {sorted(names)}')
-    return Path('/dev/r' + node.name), node, Path(mounts[0]['mount-point'])
+    return Path('/dev/r' + node.name), node, Path(mounts[0]['mount-point']), volume
 
 
 def detach(disk):
@@ -205,17 +204,16 @@ def sign_and_verify(root, name, dmg, compressed_sha, expected_uuid, dylib):
     manifest = import_manifest_tool(root)
     native = load_verifier(dylib)
 
-    disk, node, mount = attach_readonly(dmg)
+    disk, node, mount, volume_node = attach_readonly(dmg)
     try:
-        info, volume_info = volume_facts(mount, node)
+        info, volume_info = volume_facts(mount, volume_node)
         if info.get('BusProtocol') != 'Disk Image' or info.get('Writable') is not False:
             raise Failure(f'{name}: the attachment must be a read-only disk image')
         total = info.get('TotalSize')
-        # TotalSize is the authenticated extent: exactly the OS volume, not the
-        # whole GPT disk. 6077580800 % 4096 == 1536, so the final block is short
-        # and manifest.make pads the hash table accordingly; the probe pins those
-        # sample lengths [4096, 4096, 4096, 1536]. Only 512-byte sectors are
-        # guaranteed here, not 4 KiB alignment.
+        # TotalSize of the *volume* node is the authenticated extent, not the whole
+        # GPT disk. 6077580800 % 4096 == 1536, so the final block is short and the
+        # probe pins sample lengths [4096, 4096, 4096, 1536]. Only 512-byte sector
+        # alignment is guaranteed, never 4 KiB.
         if not total or total % 512:
             raise Failure(f'{name}: virtual media size {total} is not sector aligned')
         volume_uuid = volume_info.get('VolumeUUID')
@@ -223,10 +221,12 @@ def sign_and_verify(root, name, dmg, compressed_sha, expected_uuid, dylib):
             raise Failure(f'{name}: volume UUID {volume_uuid} != expected {expected_uuid}')
         if not volume_uuid:
             raise Failure(f'{name}: no VolumeUUID on the mounted member')
-        log(f'{name}: whole {disk} size {total} bytes, volume UUID {volume_uuid}')
+        # Hash the volume's own raw device, never the whole disk.
+        raw_volume = Path('/dev/r' + volume_node.name)
+        log(f'{name}: extent {raw_volume} size {total} bytes, volume UUID {volume_uuid}')
 
         log(f'{name}: signing every 4096-byte block hash with the owner key')
-        with disk.open('rb', buffering=1024 * 1024) as stream:
+        with raw_volume.open('rb', buffering=1024 * 1024) as stream:
             record = manifest.make(stream, total, keys / 'owner.pem', keys / 'owner-public.pem',
                                    volume_uuid, 1, out)
 
@@ -243,7 +243,7 @@ def sign_and_verify(root, name, dmg, compressed_sha, expected_uuid, dylib):
         wanted = {0, 1, view.block_count // 2, view.block_count - 1}
         log(f'{name}: verifying {view.block_count} blocks with the real C/RSA path')
         started = time.monotonic()
-        with disk.open('rb', buffering=1024 * 1024) as stream:
+        with raw_volume.open('rb', buffering=1024 * 1024) as stream:
             for index in range(view.block_count):
                 block = stream.read(min(4096, view.image_bytes - index * 4096))
                 if native.vr_host_block(ctypes.byref(view), index, block, len(block)) != 0:
