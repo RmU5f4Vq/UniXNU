@@ -171,30 +171,24 @@ def detach(disk):
 
 
 def read_volume_uuid(node):
-    """Volume UUID of the one mountable volume on the attached image.
+    """Volume UUID of the (single) volume on the attached image.
 
-    The attach is -nomount, so mount each volume read-only in turn just long
-    enough to ask diskutil. APFS volumes answer VolumeUUID without root; the
-    raw device is never opened here.
+    The attach is -nomount so the raw disk stays unprivileged. Volume UUIDs live
+    in each volume's superblock, which diskutil reads without mounting; only the
+    APFS container listing needs the Containers nesting resolved first.
     """
     listing = plistlib.loads(run(['diskutil', 'list', '-plist', str(node)]).stdout.encode())
-    partitions = listing.get('Partitions') or listing.get('APFSVolumes') or []
-    for entry in partitions:
-        identifier = entry.get('DeviceIdentifier')
-        if not identifier:
-            continue
-        device = f'/dev/{identifier}'
-        result = subprocess.run(['diskutil', 'mount', 'readOnly', device],
-                                capture_output=True, text=True)
-        if result.returncode:
-            continue
-        try:
-            info = plistlib.loads(run(['diskutil', 'info', '-plist', device]).stdout.encode())
-            if info.get('VolumeUUID'):
-                return info['VolumeUUID']
-        finally:
-            subprocess.run(['diskutil', 'unmount', device], capture_output=True)
-    return None
+    candidates = []
+    for container in listing.get('Containers', []):
+        candidates.extend(container.get('APFSVolumes', []))
+    candidates.extend(listing.get('APFSVolumes', []))
+    candidates.extend(listing.get('Partitions', []))
+    identifiers = [e['DeviceIdentifier'] for e in candidates if e.get('DeviceIdentifier')]
+    if len(identifiers) != 1:
+        raise Failure(f'expected exactly one volume under {node}, got {identifiers} from {listing}')
+    device = f'/dev/{identifiers[0]}'
+    info = plistlib.loads(run(['diskutil', 'info', '-plist', device]).stdout.encode())
+    return info.get('VolumeUUID')
 
 
 def import_manifest_tool(root):
