@@ -143,11 +143,17 @@ def build_esp(root, kernel, output, memory_mib, platform, accel='tcg'):
         dt += ['--platform-compatible', platform]
     subprocess.run(dt, check=True)
 
-    # serial=3 is the only channel that reports how far the guest got: UEFI, the
-    # DarwinBoot hand-off or XNU itself. boot-progress is absent on purpose, the
-    # bring-up configuration leaves CONFIG_XNU_BOOT_PROGRESS off.
+    # Same layout cli_payload.py writes for a board whose [payload] loader is not
+    # "firmware". DarwinBoot is a UEFI driver that installs UNIXNU_LOADER_PROTOCOL,
+    # and an entry of type "xnu" cannot start without it: UniXNU answers "no loader
+    # protocol installed" and the menu entry returns Unsupported. A shipped board
+    # gets the loader from its firmware volume; the QEMU firmware volume is a stock
+    # edk2 build, so here the loader has to come from the ESP.
+    # serial=3 is the only channel that reports how far the guest got; boot-progress
+    # is absent on purpose, the bring-up configuration leaves it off.
     (esp / 'EFI/UniXNU/unixnu.toml').write_text(
-        'version = 1\n\n[boot]\ntimeout = 0\ndefault = "xnu"\n\n[kits]\nautoload = false\n\n'
+        'version = 1\n[boot]\ntimeout = 0\ndefault = "xnu"\n[kits]\nautoload = false\n'
+        '[[driver]]\npath = "Payloads/DarwinBoot.efi"\n'
         '[[entry]]\nid = "xnu"\ntitle = "UniXNU"\ntype = "xnu"\n'
         'path = "Payloads/kernel.macho"\nargs = "-v serial=3"\n')
     return esp
@@ -164,7 +170,7 @@ def serial_tail(path, count=400):
 
 
 def run_guest(root, kernel, output, accel, seconds, memory_mib, platform,
-              stop, requests):
+              stop, requests, ramfb=False):
     """One QEMU boot. Returns (report, fixture) or (None, fixture) on refusal."""
     fixture = output / f'qemu-{accel}'
     fixture.mkdir(parents=True, exist_ok=True)
@@ -176,6 +182,11 @@ def run_guest(root, kernel, output, accel, seconds, memory_mib, platform,
                '--fixture', str(fixture), '--esp', str(esp), '--kernel', str(kernel),
                '--system-registers', '--timeout', str(seconds),
                '--qemu-accel', accel, '--qemu-memory-mib', str(memory_mib)]
+    if ramfb:
+        # DarwinBoot reads the framebuffer from GOP before it builds boot_args.
+        # A -display none guest has no GPU, so this is off until the serial log
+        # shows DarwinBoot refusing to hand off without it.
+        command += ['--qemu-ramfb']
     for request in requests:
         command += ['--read-memory', request]
     print('running:', ' '.join(command), flush=True)
@@ -264,6 +275,8 @@ def main():
     parser.add_argument('--qemu-memory-mib', type=int, choices=[1024, 2048, 4096, 8192], default=1024)
     parser.add_argument('--platform-compatible', default='xiaomi,sheng',
                         help='DT platform compatible string for QEMU (empty to omit)')
+    parser.add_argument('--qemu-ramfb', action='store_true',
+                        help='attach QEMU ramfb so the guest has a GOP framebuffer for DarwinBoot')
     parser.add_argument('--log-dir', type=Path,
                         help='keep the guest serial log and the raw GDB reports here; without it the '
                              'only record of where the guest stopped is deleted with the fixture')
@@ -303,7 +316,7 @@ def main():
     # tens of minutes, and the serial log is what shows the guest is advancing.
     report, fixture = run_guest(root, kernel, output, args.accel, args.timeout,
                                 args.qemu_memory_mib, args.platform_compatible,
-                                stop, requests)
+                                stop, requests, args.qemu_ramfb)
 
     # The fixture dies with the runner, so keep what the guest itself said.
     if args.log_dir:
