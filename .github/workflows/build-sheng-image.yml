@@ -547,14 +547,17 @@ jobs:
           for f in scripts/build-verified-root-probe.py kits/VerifiedRoot/tools/manifest.py; do
             [ -f "$BRINGUP_TREE/$f" ] || { echo "::error::$BRINGUP_TREE/$f missing; check unixnu fetch"; exit 1; }
           done
-          cd "$BRINGUP_TREE"
+          # unixnu is the repository-root CLI, not a file inside the assembled tree.
+          # Run it from the workspace with -D, the same way the other steps do.
+          cd "$GITHUB_WORKSPACE"
           # Out of tree, so no 7 GiB restore image: only the two named members.
-          ./unixnu ipsw fetch OS "Cryptex1,SystemOS" --ipsw "$IPSW" 2>&1 \
+          ./unixnu ipsw fetch OS "Cryptex1,SystemOS" -D "$DEVICE_DIR" --ipsw "$IPSW" 2>&1 \
             | tee "$WORK/logs/verified-root-ipsw.log"
-          # The extractor caches members under <out_root>/ipsw/<build>/; locate them
-          # by name instead of assuming how out_root relates to the tree directory.
-          OS_DMG="$(find "$(dirname "$WORK")" -name 044-76040-038.dmg -print -quit)"
-          SYS_DMG="$(find "$(dirname "$WORK")" -name 044-76034-038.dmg -print -quit)"
+          # The extractor caches members under <out_root>/ipsw/<build>/, where
+          # out_root is the repository's out/ (scripts/unixnu/config.py), not the
+          # per-configuration work directory. Locate the two members by name.
+          OS_DMG="$(find "$GITHUB_WORKSPACE/out" -name 044-76040-038.dmg -print -quit)"
+          SYS_DMG="$(find "$GITHUB_WORKSPACE/out" -name 044-76034-038.dmg -print -quit)"
           for d in "$OS_DMG" "$SYS_DMG"; do
             [ -n "$d" ] && [ -f "$d" ] || { echo "::error::IPSW member not extracted: $d"; exit 1; }
           done
