@@ -140,32 +140,29 @@ def load_verifier(dylib):
 
 
 def attach_readonly(dmg):
-    """Attach a UDIF read-only and return the pieces the verification needs.
+    """Attach read-only without mounting, the way scripts/unixnu/userdata.py does.
 
-    Returns (whole_raw, whole_node, mount_point, volume_node). The whole-disk node
-    is only used for detaching; hashing must NOT use it.
-
-    The authenticated extent is the mounted volume itself, and the whole disk is
-    larger by the partition-table sectors. On the OS member those two sizes differ
-    by 67 sectors (6077580800 vs 6077546496 bytes), which silently shifts every
-    block hash if the wrong node is read. Reading the volume's own device keeps
-    the extent exact for both members, whatever the partition layout is.
+    Returns (whole_raw, whole_node). Mounting is wrong here for two reasons:
+    the raw device of a mounted APFS volume is not readable without root
+    (Errno 13), and diskutil then reports the volume's size, which is 67 sectors
+    smaller than the logical disk the manifest must cover. -nomount exposes the
+    same bytes hdiutil would give /dev/rdiskN, with no privileges needed.
     """
-    result = run(['hdiutil', 'attach', '-readonly', '-nobrowse', '-plist', str(dmg)])
-    document = plistlib.loads(result.stdout.encode())
-    entities = document['system-entities']
-    mounts = [e for e in entities if e.get('mount-point')]
-    if len(mounts) != 1:
-        raise Failure(f'expected exactly one mounted volume, got {entities}')
-    volume = Path(mounts[0]['dev-entry'])
-    match = re.fullmatch(r'(/dev/disk\d+)s\d+', str(volume))
-    if not match:
-        raise Failure(f'cannot derive the whole-disk node from {volume}')
-    node = Path(match[1])
-    names = {e.get('dev-entry') for e in entities}
-    if str(node) not in names:
-        raise Failure(f'{node} is not among the attached entities: {sorted(names)}')
-    return Path('/dev/r' + node.name), node, Path(mounts[0]['mount-point']), volume
+    out = run(['hdiutil', 'attach', '-nomount', '-readonly', '-noverify', '-noautofsck',
+               str(dmg)]).stdout
+    for line in out.splitlines():
+        # -nomount prints "TYPE<spaces>/dev/diskN[ ...]"; accept end of line too.
+        match = re.search(r'(/dev/disk\d+)(?:\s|$)', line)
+        if match:
+            node = Path(match[1])
+            return Path('/dev/r' + node.name), node
+    raise Failure(f'could not find the attached disk device in: {out}')
+
+
+def logical_size(dmg):
+    """Size Information.Total Bytes: the logical disk, independent of mounting."""
+    info = plistlib.loads(run(['hdiutil', 'imageinfo', '-plist', str(dmg)]).stdout.encode())
+    return info['Size Information']['Total Bytes']
 
 
 def detach(disk):
@@ -173,10 +170,31 @@ def detach(disk):
     subprocess.run(['hdiutil', 'detach', node], check=False, capture_output=True)
 
 
-def volume_facts(mount, whole):
-    info = plistlib.loads(run(['diskutil', 'info', '-plist', str(whole)]).stdout.encode())
-    volume = plistlib.loads(run(['diskutil', 'info', '-plist', str(mount)]).stdout.encode())
-    return info, volume
+def read_volume_uuid(node):
+    """Volume UUID of the one mountable volume on the attached image.
+
+    The attach is -nomount, so mount each volume read-only in turn just long
+    enough to ask diskutil. APFS volumes answer VolumeUUID without root; the
+    raw device is never opened here.
+    """
+    listing = plistlib.loads(run(['diskutil', 'list', '-plist', str(node)]).stdout.encode())
+    partitions = listing.get('Partitions') or listing.get('APFSVolumes') or []
+    for entry in partitions:
+        identifier = entry.get('DeviceIdentifier')
+        if not identifier:
+            continue
+        device = f'/dev/{identifier}'
+        result = subprocess.run(['diskutil', 'mount', 'readOnly', device],
+                                capture_output=True, text=True)
+        if result.returncode:
+            continue
+        try:
+            info = plistlib.loads(run(['diskutil', 'info', '-plist', device]).stdout.encode())
+            if info.get('VolumeUUID'):
+                return info['VolumeUUID']
+        finally:
+            subprocess.run(['diskutil', 'unmount', device], capture_output=True)
+    return None
 
 
 def import_manifest_tool(root):
@@ -204,29 +222,27 @@ def sign_and_verify(root, name, dmg, compressed_sha, expected_uuid, dylib):
     manifest = import_manifest_tool(root)
     native = load_verifier(dylib)
 
-    disk, node, mount, volume_node = attach_readonly(dmg)
+    disk, node = attach_readonly(dmg)
     try:
-        info, volume_info = volume_facts(mount, volume_node)
-        if info.get('BusProtocol') != 'Disk Image' or info.get('Writable') is not False:
-            raise Failure(f'{name}: the attachment must be a read-only disk image')
-        total = info.get('TotalSize')
-        # TotalSize of the *volume* node is the authenticated extent, not the whole
-        # GPT disk. 6077580800 % 4096 == 1536, so the final block is short and the
-        # probe pins sample lengths [4096, 4096, 4096, 1536]. Only 512-byte sector
-        # alignment is guaranteed, never 4 KiB.
+        total = logical_size(dmg)
+        # The authenticated extent is the logical disk image, exactly what
+        # scripts/build-owner-os-policy.py reads from the attached whole device:
+        # 6077580800 bytes for OS (final block 1536), 3303014400 for SystemOS.
+        # hdiutil imageinfo reports it without mounting, unlike diskutil, whose
+        # TotalSize depends on which node is asked and whether a volume is mounted.
         if not total or total % 512:
-            raise Failure(f'{name}: virtual media size {total} is not sector aligned')
-        volume_uuid = volume_info.get('VolumeUUID')
+            raise Failure(f'{name}: logical image size {total} is not sector aligned')
+        # Only the volume UUID needs the volume mounted; reading it does not touch
+        # the raw device, so it stays unprivileged.
+        volume_uuid = read_volume_uuid(node)
         if expected_uuid and str(volume_uuid).upper() != expected_uuid:
             raise Failure(f'{name}: volume UUID {volume_uuid} != expected {expected_uuid}')
         if not volume_uuid:
-            raise Failure(f'{name}: no VolumeUUID on the mounted member')
-        # Hash the volume's own raw device, never the whole disk.
-        raw_volume = Path('/dev/r' + volume_node.name)
-        log(f'{name}: extent {raw_volume} size {total} bytes, volume UUID {volume_uuid}')
+            raise Failure(f'{name}: no VolumeUUID found on the attached member')
+        log(f'{name}: extent {disk} size {total} bytes, volume UUID {volume_uuid}')
 
         log(f'{name}: signing every 4096-byte block hash with the owner key')
-        with raw_volume.open('rb', buffering=1024 * 1024) as stream:
+        with disk.open('rb', buffering=1024 * 1024) as stream:
             record = manifest.make(stream, total, keys / 'owner.pem', keys / 'owner-public.pem',
                                    volume_uuid, 1, out)
 
@@ -243,7 +259,7 @@ def sign_and_verify(root, name, dmg, compressed_sha, expected_uuid, dylib):
         wanted = {0, 1, view.block_count // 2, view.block_count - 1}
         log(f'{name}: verifying {view.block_count} blocks with the real C/RSA path')
         started = time.monotonic()
-        with raw_volume.open('rb', buffering=1024 * 1024) as stream:
+        with disk.open('rb', buffering=1024 * 1024) as stream:
             for index in range(view.block_count):
                 block = stream.read(min(4096, view.image_bytes - index * 4096))
                 if native.vr_host_block(ctypes.byref(view), index, block, len(block)) != 0:
